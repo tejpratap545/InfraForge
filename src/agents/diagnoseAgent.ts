@@ -137,6 +137,22 @@ function extractFindings(steps: Step[]): Finding[] {
       if (line) findings.push({ step: stepNum, signal: `K8S_NODE: ${line}`, severity: "critical" });
     }
 
+    // K8s ingress / routing signals
+    if (/no endpoints available|upstream connect error|upstream request timeout|service.*not found|ingress.*404|ingress.*502|ingress.*503/i.test(s.result)) {
+      const line = s.result.split("\n").find((l) =>
+        /no endpoints|upstream.*error|upstream.*timeout|service.*not found|ingress.*(404|502|503)/i.test(l)
+      )?.trim().slice(0, 150);
+      if (line) findings.push({ step: stepNum, signal: `K8S_INGRESS: ${line}`, severity: "critical" });
+    }
+
+    // TLS / certificate signals
+    if (/certificate.*expir|tls.*handshake|x509|cert.*invalid|secret.*not found.*tls|certificaterequest.*failed|acme.*error|challenge.*failed/i.test(s.result)) {
+      const line = s.result.split("\n").find((l) =>
+        /expir|handshake|x509|cert.*invalid|tls.*secret|certificaterequest|acme|challenge/i.test(l)
+      )?.trim().slice(0, 150);
+      if (line) findings.push({ step: stepNum, signal: `K8S_CERT: ${line}`, severity: "critical" });
+    }
+
     // High metric values
     if (s.tool === "cw_metrics" || s.tool === "analyze_metric") {
       const maxMatch = s.result.match(/max=(\d+\.?\d*)/);
@@ -295,34 +311,16 @@ INCIDENT PATTERN RECOGNITION:
     Verify: elb_health → identify unhealthy targets → check that host's metrics/logs.
 
 TOOL SELECTION GUIDE:
-  "Service is down"          → elb_health + ecs_describe/k8s_pods + cw_metrics(5XX)
-  "Latency is high"          → cw_metrics(TargetResponseTime) + pi_top_sql + cw_logs
-  "Pods crashing"            → k8s_pods + k8s_events + k8s_logs(previous=true)
-  "DB is slow"               → pi_top_sql + cw_metrics(DBLoad,CPUUtilization,DatabaseConnections)
-  "What changed?"            → cloudtrail + ecs_describe(deployments) + k8s_events
-  "Scaling issues"           → asg_activity + cw_metrics(CPU) + elb_health
-  "Connection errors"        → cw_logs + route53_check + run_command(dig/curl)
-  "Errors after deployment"  → ecs_describe + cloudtrail + cw_logs + elb_health
-  "Cache/Redis CPU or conn"  → aws_cli("aws elasticache describe-replication-groups") + cw_metrics(namespace=AWS/ElastiCache,dimensions=ReplicationGroupId=<name>)
-  "Unknown 'cluster' type"   → FIRST identify type: aws_cli("aws elasticache describe-replication-groups --replication-group-id <name>") AND ecs_describe(cluster=<name>) in parallel
-
-K8S DEEP-DIVE PATHS (use when K8s signals found):
-  "Pods Pending / not starting"    → run_command("kubectl describe pod <pod> -n <ns>") — read Events section
-                                     + run_command("kubectl get nodes -o wide") + run_command("kubectl get events -n <ns> --field-selector reason=FailedScheduling")
-  "0/N nodes are available"        → run_command("kubectl describe nodes | grep -A8 'Conditions:\\|Taints:\\|Allocatable:'")
-                                     + run_command("kubectl top nodes") + run_command("kubectl get nodes -o wide")
-  "ImagePullBackOff/ErrImagePull"  → run_command("kubectl describe pod <pod> -n <ns>") — check image name, tag, registry
-                                     + run_command("kubectl get secret -n <ns> | grep dockerconfig")
-  "ContainerCreating (stuck)"      → run_command("kubectl describe pod <pod> -n <ns>") — check volume/PVC mounts
-                                     + run_command("kubectl get pvc -n <ns>")
-  "Taint / toleration mismatch"    → run_command("kubectl get nodes -o json | grep -A10 '\"taints\"'")
-                                     + run_command("kubectl get pod <pod> -n <ns> -o json | grep -A10 'tolerations'")
-  "Resource quota exceeded"        → run_command("kubectl describe resourcequota --all-namespaces")
-                                     + run_command("kubectl describe limitrange -n <ns>")
-  "Node NotReady / pressure"       → run_command("kubectl describe node <node>") — Conditions + Events
-                                     + aws_cli("aws ec2 describe-instance-status --instance-ids <id>")
-  "Pod logs for diagnosis"         → k8s_logs(pod=<name>, namespace=<ns>, previous=true, grep="error|panic|fatal|OOM")
-                                     — ALWAYS use previous=true when pod has restarted
+  "Service is down"         → elb_health + ecs_describe/k8s_pods + cw_metrics(5XX)
+  "Latency is high"         → cw_metrics(TargetResponseTime) + pi_top_sql + cw_logs
+  "Pods crashing/pending"   → k8s_pods + k8s_events + k8s_logs(previous=true)
+  "DB is slow"              → pi_top_sql + cw_metrics(DBLoad,CPUUtilization,DatabaseConnections)
+  "What changed?"           → cloudtrail + ecs_describe(deployments) + k8s_events
+  "Scaling issues"          → asg_activity + cw_metrics(CPU) + elb_health
+  "Connection/DNS errors"   → cw_logs + route53_check + run_command(dig/curl)
+  "Cache/Redis"             → aws_cli("aws elasticache describe-replication-groups") + cw_metrics(namespace=AWS/ElastiCache)
+  "Unknown cluster type"    → identify first: aws_cli(elasticache describe) AND ecs_describe in parallel
+  K8s signals detected      → detailed drill-down injected automatically in CURRENT PHASE above
 
 ═══ RULES ══════════════════════════════════════════════════════════════════════
 
@@ -420,7 +418,9 @@ function getPhaseHint(steps: Step[], findings: Finding[]): string {
   const hasK8sStuck    = findings.some((f) => f.signal.startsWith("K8S_STUCK:"));
   const hasK8sNode     = findings.some((f) => f.signal.startsWith("K8S_NODE:"));
   const hasK8sQuota    = findings.some((f) => f.signal.startsWith("K8S_QUOTA:"));
-  const hasK8sIssue    = hasK8sSchedule || hasK8sStuck || hasK8sNode || hasK8sQuota;
+  const hasK8sIngress  = findings.some((f) => f.signal.startsWith("K8S_INGRESS:"));
+  const hasK8sCert     = findings.some((f) => f.signal.startsWith("K8S_CERT:"));
+  const hasK8sIssue    = hasK8sSchedule || hasK8sStuck || hasK8sNode || hasK8sQuota || hasK8sIngress || hasK8sCert;
 
   if (n === 0) {
     return `CURRENT PHASE: TRIAGE (cast a wide net)
@@ -486,6 +486,36 @@ function getPhaseHint(steps: Step[], findings: Finding[]): string {
   3. run_command("kubectl top pods -n <ns> --sort-by=memory") — current consumers
   4. run_command("kubectl get pods -n <ns> -o json | grep -A2 'resources'") — requested vs actual
 → The quota section shows exactly what's exhausted (cpu, memory, pods count, PVCs).`;
+    }
+
+    // Ingress / routing failure
+    if (hasK8sIngress) {
+      return `CURRENT PHASE: K8S INGRESS DEEP-DIVE (routing or upstream failure)
+→ Something in the request path from ingress → service → pod is broken. Drill in order:
+  1. run_command("kubectl get ingress --all-namespaces") — list all ingresses, check ADDRESS assigned
+  2. run_command("kubectl describe ingress <name> -n <ns>") — rules, backend service names, TLS, annotations
+  3. run_command("kubectl get endpoints <svc> -n <ns>") — are there any ready endpoint IPs?
+     Empty endpoints = pods not ready or label selector mismatch
+  4. run_command("kubectl get svc <svc> -n <ns> -o yaml") — confirm selector matches pod labels
+  5. k8s_pods(namespace=<ns>, selector=<app-label>) — are backing pods Running?
+  6. k8s_pods(namespace=ingress-nginx) OR k8s_pods(namespace=traefik) — is the ingress controller itself healthy?
+  7. k8s_logs(pod=<ingress-controller-pod>, grep="error|upstream|connect") — controller error logs
+→ Most common causes: no ready endpoints (pods down), wrong service name in ingress rule, selector mismatch.`;
+    }
+
+    // TLS / certificate failure
+    if (hasK8sCert) {
+      return `CURRENT PHASE: K8S CERTIFICATE DEEP-DIVE (TLS/cert issue)
+→ A certificate is expired, invalid, or failed to provision. Investigate:
+  1. run_command("kubectl get certificate --all-namespaces") — READY=True/False, AGE
+  2. run_command("kubectl describe certificate <name> -n <ns>") — Status.Conditions, Last Transition
+  3. run_command("kubectl get certificaterequest --all-namespaces") — pending/failed requests
+  4. run_command("kubectl describe certificaterequest <name> -n <ns>") — failure reason (ACME challenge? DNS?)
+  5. run_command("kubectl get secret <tls-secret> -n <ns> -o json | grep '\"tls.crt\"'") — secret exists?
+  6. run_command("kubectl get challenge --all-namespaces") — active ACME challenges (HTTP-01/DNS-01)
+  7. If DNS-01: run_command("dig TXT _acme-challenge.<domain>") — DNS propagation check
+  8. k8s_logs(pod=<cert-manager-pod>, namespace=cert-manager, grep="error|failed|challenge") — cert-manager logs
+→ Most common causes: ACME challenge failing (DNS not propagated, HTTP-01 path blocked), expired secret not renewed, wrong issuer.`;
     }
 
     if (hasCritical && hasChange) {
