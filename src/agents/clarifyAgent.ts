@@ -133,7 +133,8 @@ export class ClarifyAgent {
           { maxTokens: 512 },
         );
       } catch (err) {
-        sp.fail("LLM error");
+        const errMsg = err instanceof Error ? err.message : String(err);
+        sp.fail(`LLM error: ${errMsg}`);
         throw err;
       }
       sp.fail(""); // clear spinner line

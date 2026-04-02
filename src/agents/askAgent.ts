@@ -123,9 +123,9 @@ export class AskAgent {
       try {
         raw = await this.bedrock.complete(systemPrompt(question, awsRegion, steps), { maxTokens: 1024 });
       } catch (err) {
-        sp.fail(`Step ${stepNum} — LLM error`);
-        steps.push({ tool: "_error", params: {}, thought: "LLM call failed", result: String(err) });
-        continue;
+        const errMsg = err instanceof Error ? err.message : String(err);
+        sp.fail(`Step ${stepNum} — LLM error: ${errMsg}`);
+        throw err;
       }
       sp.fail(""); // clear spinner line
 

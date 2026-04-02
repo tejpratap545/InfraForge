@@ -33,7 +33,7 @@ function makeWorkflow(
   region: string,
   modelId?: string,
   telemetry?: TelemetryCollector,
-  bedrockCredentials?: { accessKeyId: string; secretAccessKey: string },
+  bedrockCredentials?: { accessKeyId: string; secretAccessKey: string; sessionToken?: string },
 ): InfraWorkflow {
   const bedrock = new BedrockService(region, modelId, telemetry, bedrockCredentials);
   const clarifyAgent = new ClarifyAgent(bedrock);
@@ -72,9 +72,11 @@ async function run(): Promise<void> {
     // Bedrock credentials — for all LLM calls (the account where Bedrock models are deployed)
     .option("--bedrock-access-key-id <keyId>", "Access key ID for the Bedrock AWS account", process.env.BEDROCK_ACCESS_KEY_ID)
     .option("--bedrock-secret-access-key <secret>", "Secret access key for the Bedrock AWS account", process.env.BEDROCK_SECRET_ACCESS_KEY)
+    .option("--bedrock-session-token <token>", "Session token for the Bedrock AWS account (SSO / temporary credentials)", process.env.BEDROCK_SESSION_TOKEN)
     // Tenant credentials — for the account being investigated/managed (CloudWatch, CloudControl, etc.)
     .option("--aws-access-key-id <keyId>", "Access key ID for the tenant AWS account", process.env.TENANT_AWS_ACCESS_KEY_ID)
     .option("--aws-secret-access-key <secret>", "Secret access key for the tenant AWS account", process.env.TENANT_AWS_SECRET_ACCESS_KEY)
+    .option("--aws-session-token <token>", "Session token for the tenant AWS account (SSO / temporary credentials)", process.env.TENANT_AWS_SESSION_TOKEN)
     .option("--log-level <level>", "debug|info|warn|error", getConfiguredLogLevel())
     .option("--tf-dir <path>", "path to existing Terraform directory (triggers update flow)")
     .option("-i, --input <instruction>", "plain-language change description (used with --tf-dir)")
@@ -89,8 +91,10 @@ async function run(): Promise<void> {
     region: string;
     bedrockAccessKeyId?: string;
     bedrockSecretAccessKey?: string;
+    bedrockSessionToken?: string;
     awsAccessKeyId?: string;
     awsSecretAccessKey?: string;
+    awsSessionToken?: string;
     logLevel: "debug" | "info" | "warn" | "error";
     tfDir?: string;
     input?: string;
@@ -103,7 +107,7 @@ async function run(): Promise<void> {
     process.env.LOG_LEVEL = opts.logLevel;
     const awsCredentials =
       opts.awsAccessKeyId && opts.awsSecretAccessKey
-        ? { accessKeyId: opts.awsAccessKeyId, secretAccessKey: opts.awsSecretAccessKey }
+        ? { accessKeyId: opts.awsAccessKeyId, secretAccessKey: opts.awsSecretAccessKey, sessionToken: opts.awsSessionToken }
         : undefined;
     return tenantService.buildContext({
       tenantId: requiredEnv("TENANT_ID", opts.tenantId),
@@ -115,10 +119,10 @@ async function run(): Promise<void> {
   };
 
   /** Bedrock credentials — for the account where LLMs are deployed. */
-  const bedrockCreds = (): { accessKeyId: string; secretAccessKey: string } | undefined => {
+  const bedrockCreds = (): { accessKeyId: string; secretAccessKey: string; sessionToken?: string } | undefined => {
     const opts = program.opts<GlobalOpts>();
     return opts.bedrockAccessKeyId && opts.bedrockSecretAccessKey
-      ? { accessKeyId: opts.bedrockAccessKeyId, secretAccessKey: opts.bedrockSecretAccessKey }
+      ? { accessKeyId: opts.bedrockAccessKeyId, secretAccessKey: opts.bedrockSecretAccessKey, sessionToken: opts.bedrockSessionToken }
       : undefined;
   };
 

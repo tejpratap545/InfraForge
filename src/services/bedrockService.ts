@@ -26,16 +26,17 @@ export class BedrockService {
   private readonly telemetry?: TelemetryCollector;
 
   constructor(
-    region: string,
+    _region: string,
     modelId = process.env.BEDROCK_MODEL_ID?.trim() || DEFAULT_MODEL_ID,
     telemetry?: TelemetryCollector,
     credentials?: AwsCredentials,
   ) {
+    const bedrockRegion = "ap-south-1";
     this.client = new BedrockRuntimeClient({
-      region,
+      region: bedrockRegion,
       ...(credentials && { credentials }),
     });
-    this.region = region;
+    this.region = bedrockRegion;
     this.modelId = modelId;
     this.telemetry = telemetry;
     this.canFallbackToMarketplaceFreeModel =

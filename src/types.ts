@@ -8,6 +8,7 @@ export type InfraResourceType = string;
 export interface AwsCredentials {
   accessKeyId: string;
   secretAccessKey: string;
+  sessionToken?: string;
 }
 
 export interface TenantContext {
