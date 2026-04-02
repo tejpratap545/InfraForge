@@ -386,13 +386,13 @@ export class InfraWorkflow {
 
   // ── ask ──────────────────────────────────────────────────────────────────────
 
-  async ask(question: string, tenant: TenantContext): Promise<void> {
+  async ask(question: string, tenant: TenantContext, k8sContext?: string): Promise<void> {
     const startedAt = Date.now();
     const trace = this.tracing.createTrace(tenant.tenantId, "ask");
     this.rateLimiter.assertWithinLimit(tenant, this.subscription.getLimits(tenant).commandsPerMinute);
     this.tracing.log(trace, "Ask workflow start", { question, tenantId: tenant.tenantId });
 
-    const answer = await this.askAgent.run(question, tenant.awsRegion, undefined, tenant.awsCredentials);
+    const answer = await this.askAgent.run(question, tenant.awsRegion, k8sContext, tenant.awsCredentials);
     if (answer) console.log(answer);
 
     // ── Persist Q&A to history file ──────────────────────────────────────────

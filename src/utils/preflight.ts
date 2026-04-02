@@ -24,6 +24,8 @@ export interface PreflightResult {
   awsAccountId?: string;
   /** True if kubectl is reachable for the given context. */
   k8sReady: boolean;
+  /** Resolved kubectl context name (auto-discovered if not supplied). */
+  k8sContext?: string;
   /** MCP server names that connected successfully. */
   mcpServers: string[];
   /** Detected service groups from the question. */
@@ -64,12 +66,20 @@ async function checkAws(region: string, credentials?: AwsCredentials): Promise<{
 
 // ─── K8s connectivity check ───────────────────────────────────────────────────
 
-async function checkK8s(k8sContext?: string): Promise<{ ok: boolean; clusterInfo?: string }> {
-  if (!k8sContext) return { ok: false };
-  const raw = await shellFast(`kubectl cluster-info --context ${k8sContext} 2>&1`);
+async function checkK8s(k8sContext?: string): Promise<{ ok: boolean; resolvedContext?: string; clusterInfo?: string }> {
+  // Auto-discover current context when none is explicitly provided
+  let ctx = k8sContext;
+  if (!ctx) {
+    const discovered = await shellFast("kubectl config current-context 2>&1");
+    if (!discovered || discovered.includes("error") || discovered.includes("no context")) {
+      return { ok: false };
+    }
+    ctx = discovered.trim();
+  }
+  const raw = await shellFast(`kubectl cluster-info --context ${ctx} 2>&1`);
   const ok = raw.includes("running") || raw.includes("https://");
   const clusterInfo = ok ? raw.split("\n")[0].slice(0, 120) : undefined;
-  return { ok, clusterInfo };
+  return { ok, resolvedContext: ok ? ctx : undefined, clusterInfo };
 }
 
 // ─── Main preflight ───────────────────────────────────────────────────────────
@@ -90,6 +100,9 @@ export async function runPreflight(
     checkK8s(k8sContext),
   ]);
 
+  // Use auto-discovered context if none was explicitly provided
+  const resolvedK8sContext = k8sResult.resolvedContext;
+
   const mcpServers = mcpService?.isConnected() ? mcpService.getConnectedServers() : [];
   const mcpTools   = mcpService?.isConnected() ? mcpService.getDiscoveredTools() : [];
 
@@ -104,11 +117,12 @@ export async function runPreflight(
   }
 
   if (k8sResult.ok) {
-    lines.push(`  K8s:     ✓ connected  context=${k8sContext}  ${k8sResult.clusterInfo ?? ""}`);
+    const autoTag = !k8sContext ? " (auto-discovered)" : "";
+    lines.push(`  K8s:     ✓ connected  context=${resolvedK8sContext}${autoTag}  ${k8sResult.clusterInfo ?? ""}`);
   } else if (k8sContext) {
     lines.push(`  K8s:     ✗ context "${k8sContext}" not reachable`);
   } else {
-    lines.push(`  K8s:     – not configured`);
+    lines.push(`  K8s:     – no active kubectl context`);
   }
 
   lines.push(`  aws cli: ✓ available`);
@@ -130,6 +144,7 @@ export async function runPreflight(
     awsReady: awsResult.ok,
     awsAccountId: awsResult.accountId,
     k8sReady: k8sResult.ok,
+    k8sContext: resolvedK8sContext,
     mcpServers,
     routing,
   };

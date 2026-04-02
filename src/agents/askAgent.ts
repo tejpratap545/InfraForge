@@ -146,7 +146,7 @@ export class AskAgent {
 
     const mcpTools = this.mcpService?.isConnected() ? this.mcpService.getDiscoveredTools() : undefined;
     const preflight = await runPreflight(awsRegion, question, credentials, k8sContext, this.mcpService);
-    const ctx: ToolContext = { awsRegion, k8sContext, awsCredentials: credentials, mcpService: this.mcpService };
+    const ctx: ToolContext = { awsRegion, k8sContext: preflight.k8sContext, awsCredentials: credentials, mcpService: this.mcpService };
     const steps: Step[] = [];
     let finalAnswer = "";
     let stepNum = 0;

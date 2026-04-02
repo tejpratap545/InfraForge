@@ -200,10 +200,11 @@ async function run(): Promise<void> {
     .command("ask")
     .description("Answer AWS inventory questions from live AWS account data.")
     .requiredOption("-q, --question <question>", "question about your AWS account")
+    .option("--k8s-context <context>", "kubectl context name (default: current context)")
     .action(async (cmd) => {
       const tenant = buildTenant();
       const workflow = makeWorkflow(tenant.awsRegion, undefined, undefined, bedrockCreds());
-      await workflow.ask(cmd.question, tenant);
+      await workflow.ask(cmd.question, tenant, cmd.k8sContext);
     });
 
   program

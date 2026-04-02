@@ -105,6 +105,38 @@ function extractFindings(steps: Step[]): Finding[] {
       if (line) findings.push({ step: stepNum, signal: line, severity: "critical" });
     }
 
+    // K8s scheduling / node signals
+    if (/0\/\d+ nodes are available|insufficient|taint|toleration|unschedulable/i.test(s.result)) {
+      const line = s.result.split("\n").find((l) =>
+        /0\/\d+ nodes|insufficient|taint|toleration|unschedulable/i.test(l)
+      )?.trim().slice(0, 150);
+      if (line) findings.push({ step: stepNum, signal: `K8S_SCHEDULE: ${line}`, severity: "critical" });
+    }
+
+    // K8s pod stuck signals
+    if (/imagepullbackoff|errimagepull|containercreating|pending.*pod|pod.*pending/i.test(s.result)) {
+      const line = s.result.split("\n").find((l) =>
+        /imagepullbackoff|errimagepull|containercreating|pending/i.test(l)
+      )?.trim().slice(0, 150);
+      if (line) findings.push({ step: stepNum, signal: `K8S_STUCK: ${line}`, severity: "critical" });
+    }
+
+    // K8s resource quota / limit signals
+    if (/exceeded quota|quota.*exceeded|limitrange|resource quota/i.test(s.result)) {
+      const line = s.result.split("\n").find((l) =>
+        /quota|limitrange/i.test(l)
+      )?.trim().slice(0, 150);
+      if (line) findings.push({ step: stepNum, signal: `K8S_QUOTA: ${line}`, severity: "critical" });
+    }
+
+    // K8s node pressure / eviction signals
+    if (/memorypressure|diskpressure|pidpressure|notready.*node|node.*notready|evict/i.test(s.result)) {
+      const line = s.result.split("\n").find((l) =>
+        /memorypressure|diskpressure|pidpressure|notready|evict/i.test(l)
+      )?.trim().slice(0, 150);
+      if (line) findings.push({ step: stepNum, signal: `K8S_NODE: ${line}`, severity: "critical" });
+    }
+
     // High metric values
     if (s.tool === "cw_metrics" || s.tool === "analyze_metric") {
       const maxMatch = s.result.match(/max=(\d+\.?\d*)/);
@@ -274,6 +306,24 @@ TOOL SELECTION GUIDE:
   "Cache/Redis CPU or conn"  → aws_cli("aws elasticache describe-replication-groups") + cw_metrics(namespace=AWS/ElastiCache,dimensions=ReplicationGroupId=<name>)
   "Unknown 'cluster' type"   → FIRST identify type: aws_cli("aws elasticache describe-replication-groups --replication-group-id <name>") AND ecs_describe(cluster=<name>) in parallel
 
+K8S DEEP-DIVE PATHS (use when K8s signals found):
+  "Pods Pending / not starting"    → run_command("kubectl describe pod <pod> -n <ns>") — read Events section
+                                     + run_command("kubectl get nodes -o wide") + run_command("kubectl get events -n <ns> --field-selector reason=FailedScheduling")
+  "0/N nodes are available"        → run_command("kubectl describe nodes | grep -A8 'Conditions:\\|Taints:\\|Allocatable:'")
+                                     + run_command("kubectl top nodes") + run_command("kubectl get nodes -o wide")
+  "ImagePullBackOff/ErrImagePull"  → run_command("kubectl describe pod <pod> -n <ns>") — check image name, tag, registry
+                                     + run_command("kubectl get secret -n <ns> | grep dockerconfig")
+  "ContainerCreating (stuck)"      → run_command("kubectl describe pod <pod> -n <ns>") — check volume/PVC mounts
+                                     + run_command("kubectl get pvc -n <ns>")
+  "Taint / toleration mismatch"    → run_command("kubectl get nodes -o json | grep -A10 '\"taints\"'")
+                                     + run_command("kubectl get pod <pod> -n <ns> -o json | grep -A10 'tolerations'")
+  "Resource quota exceeded"        → run_command("kubectl describe resourcequota --all-namespaces")
+                                     + run_command("kubectl describe limitrange -n <ns>")
+  "Node NotReady / pressure"       → run_command("kubectl describe node <node>") — Conditions + Events
+                                     + aws_cli("aws ec2 describe-instance-status --instance-ids <id>")
+  "Pod logs for diagnosis"         → k8s_logs(pod=<name>, namespace=<ns>, previous=true, grep="error|panic|fatal|OOM")
+                                     — ALWAYS use previous=true when pod has restarted
+
 ═══ RULES ══════════════════════════════════════════════════════════════════════
 
 1. TRIAGE FIRST — always fan-out 4-6 parallel calls on step 1. Cover: errors, latency,
@@ -364,24 +414,80 @@ Your next action:`;
 /** Phase-specific guidance based on progress and evidence quality. */
 function getPhaseHint(steps: Step[], findings: Finding[]): string {
   const n = steps.length;
-  const hasCritical = findings.some((f) => f.severity === "critical");
-  const hasChange   = findings.some((f) => f.signal.startsWith("CHANGE:"));
+  const hasCritical    = findings.some((f) => f.severity === "critical");
+  const hasChange      = findings.some((f) => f.signal.startsWith("CHANGE:"));
+  const hasK8sSchedule = findings.some((f) => f.signal.startsWith("K8S_SCHEDULE:"));
+  const hasK8sStuck    = findings.some((f) => f.signal.startsWith("K8S_STUCK:"));
+  const hasK8sNode     = findings.some((f) => f.signal.startsWith("K8S_NODE:"));
+  const hasK8sQuota    = findings.some((f) => f.signal.startsWith("K8S_QUOTA:"));
+  const hasK8sIssue    = hasK8sSchedule || hasK8sStuck || hasK8sNode || hasK8sQuota;
 
   if (n === 0) {
     return `CURRENT PHASE: TRIAGE (cast a wide net)
 → Launch 4-6 parallel calls to scope the incident:
   • Error rates: cw_metrics for 5XX counts, or elb_health for target status
   • Latency: cw_metrics for TargetResponseTime or service response times
-  • Resource status: ecs_describe or k8s_pods to see current state
+  • Resource status: ecs_describe or k8s_pods(namespace=all) to see current state across ALL namespaces
   • Recent changes: cloudtrail(since_hours=3) for deploys and config changes
   • Logs: cw_logs for recent errors in the affected service
   • Infrastructure: cw_metrics for CPU/memory/connections
+→ For K8s questions: start with k8s_pods(namespace=<target>) AND k8s_events(namespace=all,severity=warning) in parallel.
+   If pods not found in expected namespace, try k8s_pods across monitoring/observability/kube-system namespaces.
 → Goal: determine SCOPE (all users? one service? one AZ?) and TIMING (when did it start?)
 → DO NOT deep-dive yet. Breadth first, depth second.
 → IMPORTANT: If the data shows normal values, that IS the finding — do not search harder to confirm the user's claim.`;
   }
 
   if (n <= 5) {
+    // K8s scheduling failure — pivot immediately to node/quota investigation
+    if (hasK8sSchedule) {
+      return `CURRENT PHASE: K8S SCHEDULING DEEP-DIVE (pods cannot be scheduled)
+→ "0/N nodes available" means the scheduler rejected every node. Find out WHY:
+  1. run_command("kubectl describe pod <pod> -n <ns>") — exact FailedScheduling reason
+  2. run_command("kubectl get nodes -o wide") — node count, roles, status, version
+  3. run_command("kubectl describe nodes | grep -A5 'Conditions:\\|Taints:\\|Allocatable:'") — pressure + taints
+  4. run_command("kubectl get resourcequota --all-namespaces") — quota exhaustion check
+  5. run_command("kubectl get events --all-namespaces --field-selector reason=FailedScheduling --sort-by=.lastTimestamp") — all scheduling failures
+→ Most common causes: node taints with no matching tolerations, insufficient CPU/memory, node NotReady, quota exceeded.
+→ Run ALL 5 in parallel — this is a scheduling problem, not an application problem.`;
+    }
+
+    // K8s pod stuck (ImagePull, ContainerCreating)
+    if (hasK8sStuck) {
+      return `CURRENT PHASE: K8S POD STUCK DEEP-DIVE
+→ Pod is stuck before running. Describe the pod for the exact reason:
+  1. run_command("kubectl describe pod <pod> -n <ns>") — Events section has the root cause
+  2. If ImagePullBackOff: check image name/tag, registry credentials (imagePullSecrets)
+     run_command("kubectl get secret -n <ns>") — list pull secrets
+  3. If ContainerCreating: check volume mounts
+     run_command("kubectl get pvc -n <ns>") — PVC bound status
+  4. k8s_logs(pod, previous=true) — any init container output
+→ Run describe + get pvc in parallel.`;
+    }
+
+    // K8s node pressure
+    if (hasK8sNode) {
+      return `CURRENT PHASE: K8S NODE PRESSURE DEEP-DIVE
+→ Node(s) are under pressure or NotReady. Drill into node state:
+  1. run_command("kubectl get nodes -o wide") — which nodes are NotReady
+  2. run_command("kubectl describe node <node-name>") — Conditions, Capacity, Allocatable, Events
+  3. run_command("kubectl top nodes") — actual CPU/memory usage vs allocatable
+  4. run_command("kubectl get pods --all-namespaces --field-selector spec.nodeName=<node> | grep -v Running") — pods on bad node
+  5. aws_cli("aws ec2 describe-instance-status --filters Name=instance-state-name,Values=running") — underlying EC2 health
+→ Focus on the node that shows pressure first, then check if it's isolated or cluster-wide.`;
+    }
+
+    // K8s quota exceeded
+    if (hasK8sQuota) {
+      return `CURRENT PHASE: K8S RESOURCE QUOTA DEEP-DIVE
+→ Resource quota is blocking pod creation:
+  1. run_command("kubectl describe resourcequota -n <ns>") — used vs hard limits
+  2. run_command("kubectl describe limitrange -n <ns>") — per-pod/container limits
+  3. run_command("kubectl top pods -n <ns> --sort-by=memory") — current consumers
+  4. run_command("kubectl get pods -n <ns> -o json | grep -A2 'resources'") — requested vs actual
+→ The quota section shows exactly what's exhausted (cpu, memory, pods count, PVCs).`;
+    }
+
     if (hasCritical && hasChange) {
       return `CURRENT PHASE: CORRELATE (you have critical signals AND a change detected)
 → Priority: correlate the deployment/change timestamp with the anomaly start time.
@@ -403,6 +509,19 @@ function getPhaseHint(steps: Step[], findings: Finding[]): string {
   }
 
   if (n <= 12) {
+    // Still seeing K8s issues deeper in investigation — keep drilling
+    if (hasK8sIssue && hasCritical) {
+      return `CURRENT PHASE: K8S ROOT CAUSE CONFIRMATION (${findings.filter((f) => f.severity === "critical").length} critical K8s findings)
+→ You have K8s scheduling/node evidence. Confirm the exact root cause:
+  • If scheduling: run_command("kubectl describe pod <pod> -n <ns>") → read the "Events:" section verbatim
+  • If node: run_command("kubectl describe node <node>") → read "Conditions:" and "Events:" sections
+  • If quota: run_command("kubectl describe resourcequota -n <ns>") → exact used/hard values
+  • Check if this is namespace-scoped or cluster-wide: k8s_events(namespace=all, severity=warning)
+  • If nodes are fine but pods won't schedule: check taints/tolerations mismatch
+    run_command("kubectl get nodes -o json | grep -A5 taints")
+→ State your theory NOW. One confirm query, then conclude.`;
+    }
+
     if (hasCritical) {
       return `CURRENT PHASE: HYPOTHESIS TESTING (you have ${findings.filter((f) => f.severity === "critical").length} critical findings)
 → State your #1 theory in "thought". What SPECIFICALLY do you think caused this?
@@ -470,7 +589,7 @@ export class DiagnoseAgent {
 
     const ctx: ToolContext = {
       awsRegion,
-      k8sContext: options.k8sContext,
+      k8sContext: preflight.k8sContext,
       awsCredentials: credentials,
       mcpService: this.mcpService,
     };
