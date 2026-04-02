@@ -32,6 +32,7 @@ import { executeTool, buildToolCatalog, ToolContext } from "../services/diagnose
 import { AwsMcpService } from "../services/awsMcpService";
 import { parseJsonPayload } from "../utils/llm";
 import { c, sym, Spinner, printBoxHeader, renderReport } from "../utils/terminal";
+import { runPreflight } from "../utils/preflight";
 import { DebugOptions, AwsCredentials } from "../types";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -206,6 +207,7 @@ function systemPrompt(
   options: DebugOptions,
   toolCatalog: string,
   mcpTools?: { name: string }[],
+  preflightContext?: string,
 ): string {
   const history       = compressHistory(steps);
   const toolSection   = steps.length === 0 ? toolCatalog : buildCompactToolRef(mcpTools);
@@ -330,8 +332,8 @@ CONCLUSION FORMAT — be specific and actionable:
 
 ═════════════════════════════════════════════════════════════════════════════════
 
+${preflightContext ?? `REGION: ${awsRegion}`}
 PROBLEM  : ${question}
-REGION   : ${awsRegion}
 TIME     : ${new Date().toISOString()}
 
 INVESTIGATION HISTORY (${steps.length} steps, ${steps.reduce((a, s) => a + s.durationMs, 0)}ms total):
@@ -441,6 +443,9 @@ export class DiagnoseAgent {
       console.log("");
     }
 
+    // ── Preflight: validate AWS, k8s, MCP connectivity ───────────────────────
+    const preflight = await runPreflight(awsRegion, question, credentials, options.k8sContext, this.mcpService);
+
     // ── Build dynamic tool catalog (includes MCP tools if connected) ─────────
     const mcpTools = this.mcpService?.isConnected()
       ? this.mcpService.getDiscoveredTools()
@@ -467,7 +472,7 @@ export class DiagnoseAgent {
       let raw: string;
       try {
         raw = await this.bedrock.complete(
-          systemPrompt(question, awsRegion, steps, options, toolCatalog, mcpTools),
+          systemPrompt(question, awsRegion, steps, options, toolCatalog, mcpTools, preflight.context),
           { maxTokens: STEP_MAX_TOKENS },
         );
         consecutiveErrors = 0;
@@ -492,7 +497,7 @@ export class DiagnoseAgent {
           );
           try {
             const retryRaw = await this.bedrock.complete(
-              systemPrompt(question, awsRegion, steps, options, toolCatalog, mcpTools) +
+              systemPrompt(question, awsRegion, steps, options, toolCatalog, mcpTools, preflight.context) +
               "\n\nYour previous conclusion was truncated. Conclude NOW with done=true. Be complete but concise — no code blocks longer than 3 lines. Prioritize the evidence chain and remediation steps.",
               { maxTokens: CONCLUSION_MAX_TOKENS },
             );
@@ -586,7 +591,7 @@ export class DiagnoseAgent {
       const sp = new Spinner().start("Synthesising root cause analysis…");
       try {
         const forcePrompt =
-          systemPrompt(question, awsRegion, steps, options, toolCatalog, mcpTools) +
+          systemPrompt(question, awsRegion, steps, options, toolCatalog, mcpTools, preflight.context) +
           "\n\nStep limit reached. You MUST conclude now with done=true. " +
           "Use the evidence board above. Name the most likely root cause with the evidence chain. " +
           "If uncertain, rank your top 2 hypotheses by likelihood.";

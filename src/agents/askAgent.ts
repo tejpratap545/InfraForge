@@ -18,6 +18,7 @@ import { parseJsonPayload } from "../utils/llm";
 import { c, sym, Spinner, printBoxHeader, renderReport } from "../utils/terminal";
 import type { AwsCredentials } from "../types";
 import type { AwsMcpService } from "../services/awsMcpService";
+import { runPreflight } from "../utils/preflight";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -70,7 +71,7 @@ const TOOL_NAMES =
   "aws_cli(command)  [any read-only AWS CLI cmd — xray, guardduty, health, config, ecr, secretsmanager, ssm params, etc.]\n" +
   "Parallel: {\"calls\":[{\"tool\":\"...\",\"params\":{...}},{...}]}";
 
-function systemPrompt(question: string, awsRegion: string, steps: Step[], mcpTools?: { name: string; params: string[]; description: string }[]): string {
+function systemPrompt(question: string, awsRegion: string, steps: Step[], mcpTools?: { name: string; params: string[]; description: string }[], preflightContext?: string): string {
   const history = compressHistory(steps);
   const toolSection = steps.length === 0 ? buildToolCatalog(mcpTools) : TOOL_NAMES;
 
@@ -102,8 +103,8 @@ RULES:
 - NO DATAPOINTS → run aws_cli("aws cloudwatch list-metrics --namespace <ns> --dimensions Name=<dim>,Value=<val> --region <r>") BEFORE retrying cw_metrics. Use the exact names from that output.
 - CLUSTER TYPE UNKNOWN → check ElastiCache AND ECS in parallel: aws_cli("aws elasticache describe-replication-groups --replication-group-id <name>") + ecs_describe(cluster=<name>).
 
+${preflightContext ?? `REGION: ${awsRegion}`}
 QUESTION : ${question}
-REGION   : ${awsRegion}
 TIME     : ${new Date().toISOString()}
 
 QUERY HISTORY:
@@ -143,6 +144,7 @@ export class AskAgent {
     }
 
     const mcpTools = this.mcpService?.isConnected() ? this.mcpService.getDiscoveredTools() : undefined;
+    const preflight = await runPreflight(awsRegion, question, credentials, k8sContext, this.mcpService);
     const ctx: ToolContext = { awsRegion, k8sContext, awsCredentials: credentials, mcpService: this.mcpService };
     const steps: Step[] = [];
     let finalAnswer = "";
@@ -155,7 +157,7 @@ export class AskAgent {
       const sp = new Spinner().start(`Step ${stepNum}/${MAX_STEPS}  ·  thinking…`);
       let raw: string;
       try {
-        raw = await this.bedrock.complete(systemPrompt(question, awsRegion, steps, mcpTools), { maxTokens: STEP_MAX_TOKENS });
+        raw = await this.bedrock.complete(systemPrompt(question, awsRegion, steps, mcpTools, preflight.context), { maxTokens: STEP_MAX_TOKENS });
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
         sp.fail(`Step ${stepNum} — LLM error: ${errMsg}`);
@@ -224,7 +226,7 @@ export class AskAgent {
       const sp = new Spinner().start("Synthesising answer…");
       try {
         const forcePrompt =
-          systemPrompt(question, awsRegion, steps) +
+          systemPrompt(question, awsRegion, steps, mcpTools, preflight.context) +
           "\n\nYou have reached the step limit. Answer now with done:true using all data gathered so far.";
         const raw2 = await this.bedrock.complete(forcePrompt, { maxTokens: ANSWER_MAX_TOKENS });
         const p2 = parseJsonPayload(raw2, "ask force-answer") as LLMResponse;
