@@ -133,6 +133,8 @@ export interface DebugOptions {
   k8sContext?: string;
   /** AWS region forwarded from TenantContext. */
   awsRegion?: string;
+  /** Investigation depth: quick=8 steps, standard=25 (default), deep=40. */
+  reasoning?: "quick" | "standard" | "deep";
 }
 
 /** Extracted intent from a natural-language diagnose question. */

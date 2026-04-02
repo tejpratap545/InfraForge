@@ -40,7 +40,7 @@ type LLMResponse =
   | { done: false; thought: string; calls: ToolCall[]; tool?: never; params?: never }
   | { done: true;  thought: string; answer: string };
 
-const MAX_STEPS = 15;
+const MAX_STEPS_BY_REASONING = { quick: 5, standard: 15, deep: 25 } as const;
 const STEP_MAX_TOKENS = 2048;
 const ANSWER_MAX_TOKENS = 4096;
 
@@ -122,7 +122,7 @@ export class AskAgent {
     private readonly mcpService?: AwsMcpService,
   ) {}
 
-  async run(question: string, awsRegion: string, k8sContext?: string, credentials?: AwsCredentials): Promise<string> {
+  async run(question: string, awsRegion: string, k8sContext?: string, credentials?: AwsCredentials, reasoning?: "quick" | "standard" | "deep"): Promise<string> {
     console.log("");
     printBoxHeader(`Asking · ${question.slice(0, 60)}`);
     console.log("");
@@ -147,15 +147,17 @@ export class AskAgent {
     const mcpTools = this.mcpService?.isConnected() ? this.mcpService.getDiscoveredTools() : undefined;
     const preflight = await runPreflight(awsRegion, question, credentials, k8sContext, this.mcpService);
     const ctx: ToolContext = { awsRegion, k8sContext: preflight.k8sContext, awsCredentials: credentials, mcpService: this.mcpService };
+    const maxSteps = MAX_STEPS_BY_REASONING[reasoning ?? "standard"];
+
     const steps: Step[] = [];
     let finalAnswer = "";
     let stepNum = 0;
 
-    while (stepNum < MAX_STEPS) {
+    while (stepNum < maxSteps) {
       stepNum++;
 
       // ── Ask LLM what to query next ───────────────────────────────────────
-      const sp = new Spinner().start(`Step ${stepNum}/${MAX_STEPS}  ·  thinking…`);
+      const sp = new Spinner().start(`Step ${stepNum}/${maxSteps}  ·  thinking…`);
       let raw: string;
       try {
         raw = await this.bedrock.complete(systemPrompt(question, awsRegion, steps, mcpTools, preflight.context), { maxTokens: STEP_MAX_TOKENS });

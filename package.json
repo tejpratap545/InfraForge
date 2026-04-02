@@ -7,10 +7,11 @@
     "infra": "dist/cli/index.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && chmod +x dist/cli/index.js",
     "dev": "ts-node src/cli/index.ts",
     "start": "node dist/cli/index.js",
-    "lint": "tsc --noEmit -p tsconfig.json"
+    "lint": "tsc --noEmit -p tsconfig.json",
+    "install:cli": "npm run build && npm link"
   },
   "keywords": [
     "infra",

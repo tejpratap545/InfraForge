@@ -22,7 +22,7 @@ function normalizeLogLevel(value?: string): LogLevel {
     case "error":
       return value.trim().toLowerCase() as LogLevel;
     default:
-      return "debug";
+      return "error";
   }
 }
 

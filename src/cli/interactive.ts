@@ -1,9 +1,16 @@
 /**
- * Interactive session — arrow-key mode + model picker, then a persistent
- * run loop. Launched when `infra` is called with no subcommand.
+ * Interactive session — arrow-key mode + model + reasoning picker,
+ * then a persistent run loop.
  *
- * Slash commands available at the query prompt:
- *   /mode   — re-pick investigation mode
+ * Commands:
+ *   ask          — Q&A about live AWS/K8s environment
+ *   diagnose     — Deep incident investigation
+ *   plan create  — Generate and apply new infrastructure
+ *   plan dry-run — Show what would change, no execution
+ *   plan apply   — Apply a change (new or patch existing TF dir)
+ *
+ * Slash commands at the prompt:
+ *   /mode   — re-pick mode
  *   /model  — re-pick LLM model
  *   /switch — re-pick both
  *   /exit   — quit
@@ -24,20 +31,30 @@ interface MenuItem {
 }
 
 const MODES: MenuItem[] = [
-  { id: "diagnose", label: "diagnose", desc: "Ask a plain-English question — auto-discovers everything" },
-  { id: "debug",    label: "debug",    desc: "Collect signals for a specific service name" },
-  { id: "ask",      label: "ask",      desc: "Query your live AWS inventory" },
-  { id: "create",   label: "create",   desc: "Generate and apply Terraform infrastructure" },
-  { id: "plan",     label: "plan",     desc: "Dry-run plan — no changes applied" },
-  { id: "apply",    label: "apply",    desc: "Apply Terraform with confirmation gate" },
+  { id: "ask",         label: "ask",          desc: "Q&A about your live AWS / K8s environment" },
+  { id: "diagnose",    label: "diagnose",      desc: "Deep incident investigation — root cause analysis" },
+  { id: "plan:create", label: "plan create",   desc: "Generate and apply new infrastructure" },
+  { id: "plan:dryrun", label: "plan dry-run",  desc: "Show what would change — no execution" },
+  { id: "plan:apply",  label: "plan apply",    desc: "Apply a change (new or patch existing Terraform dir)" },
+];
+
+const REASONING: MenuItem[] = [
+  { id: "quick",    label: "quick",    desc: "Fast — 5/8 steps   · inventory checks, simple issues" },
+  { id: "standard", label: "standard", desc: "Balanced — 15/25 steps  · most incidents  (default)" },
+  { id: "deep",     label: "deep",     desc: "Thorough — 25/40 steps  · complex failures, cert/ingress" },
+];
+
+const ENGINE: MenuItem[] = [
+  { id: "terraform", label: "terraform", desc: "HCL files → terraform plan → terraform apply  (default)" },
+  { id: "aws",       label: "aws",       desc: "Cloud Control API — fast provisioning, no state file" },
 ];
 
 const REGIONS: MenuItem[] = [
-  { id: "us-east-1",      label: "us-east-1",      desc: "US East — N. Virginia  (default)" },
+  { id: "ap-south-1",     label: "ap-south-1",     desc: "Asia Pacific — Mumbai  (default)" },
+  { id: "us-east-1",      label: "us-east-1",      desc: "US East — N. Virginia" },
   { id: "us-east-2",      label: "us-east-2",      desc: "US East — Ohio" },
   { id: "us-west-1",      label: "us-west-1",      desc: "US West — N. California" },
   { id: "us-west-2",      label: "us-west-2",      desc: "US West — Oregon" },
-  { id: "ap-south-1",     label: "ap-south-1",     desc: "Asia Pacific — Mumbai" },
   { id: "ap-southeast-1", label: "ap-southeast-1", desc: "Asia Pacific — Singapore" },
   { id: "ap-southeast-2", label: "ap-southeast-2", desc: "Asia Pacific — Sydney" },
   { id: "ap-northeast-1", label: "ap-northeast-1", desc: "Asia Pacific — Tokyo" },
@@ -74,16 +91,15 @@ const MODELS: MenuItem[] = [
   },
 ];
 
-// ─── Arrow-key selection menu ────────────────────────────────────────────────
-// Returns null if the user pressed Escape or Backspace (go back).
+// ─── Arrow-key selection menu ─────────────────────────────────────────────────
 
 const LABEL_WIDTH = 18;
 
 function renderMenuLines(prompt: string, items: MenuItem[], selected: number): string[] {
   const lines: string[] = [];
-  lines.push(""); // blank before title
+  lines.push("");
   lines.push(`  ${c.bold(c.cyan(sym.dot))}  ${c.bold(prompt)}`);
-  lines.push(""); // blank after title
+  lines.push("");
   for (let i = 0; i < items.length; i++) {
     const active = i === selected;
     const cursor = active ? c.cyan("❯") : " ";
@@ -93,7 +109,7 @@ function renderMenuLines(prompt: string, items: MenuItem[], selected: number): s
     const desc = c.dim(items[i].desc);
     lines.push(`    ${cursor}  ${label}  ${desc}`);
   }
-  lines.push(""); // blank
+  lines.push("");
   lines.push(c.dim("  ↑↓  navigate    Enter  select    Esc/←  back    Ctrl+C  exit"));
   return lines;
 }
@@ -101,11 +117,8 @@ function renderMenuLines(prompt: string, items: MenuItem[], selected: number): s
 async function selectMenu(prompt: string, items: MenuItem[], canGoBack = false): Promise<MenuItem | null> {
   return new Promise((resolve, reject) => {
     let selected = 0;
-
-    // Hide cursor while navigating.
     process.stdout.write("\x1b[?25l");
 
-    // Initial draw.
     const lines = renderMenuLines(prompt, items, selected);
     for (const l of lines) process.stdout.write(l + "\n");
 
@@ -126,7 +139,7 @@ async function selectMenu(prompt: string, items: MenuItem[], canGoBack = false):
     function cleanup() {
       process.stdin.removeListener("keypress", onKey);
       if (process.stdin.isTTY) process.stdin.setRawMode(false);
-      process.stdout.write("\x1b[?25h"); // restore cursor
+      process.stdout.write("\x1b[?25h");
     }
 
     function onKey(_str: string, key: readline.Key) {
@@ -136,13 +149,8 @@ async function selectMenu(prompt: string, items: MenuItem[], canGoBack = false):
         process.stdout.write("\n");
         process.exit(0);
       }
-      // Escape or left-arrow or backspace = go back (if allowed).
       if (key.name === "escape" || key.name === "left" || key.name === "backspace") {
-        if (canGoBack) {
-          cleanup();
-          process.stdout.write("\n");
-          resolve(null);
-        }
+        if (canGoBack) { cleanup(); process.stdout.write("\n"); resolve(null); }
         return;
       }
       if (key.name === "up") {
@@ -173,17 +181,9 @@ async function textInput(prompt: string, hint?: string): Promise<string> {
   process.stdout.write(`  ${c.cyan("›")} `);
 
   return new Promise((resolve) => {
-    const rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-      terminal: false,
-    });
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: false });
     let done = false;
-    rl.once("line", (line) => {
-      done = true;
-      rl.close();
-      resolve(line.trim());
-    });
+    rl.once("line", (line) => { done = true; rl.close(); resolve(line.trim()); });
     rl.once("close", () => { if (!done) resolve(""); });
   });
 }
@@ -193,64 +193,94 @@ async function textInput(prompt: string, hint?: string): Promise<string> {
 async function executeMode(
   workflow: InfraWorkflow,
   modeId: string,
+  engine: string,
+  reasoning: string,
   input: string,
   tenant: TenantContext,
 ): Promise<void> {
+  const r = reasoning as "quick" | "standard" | "deep";
   switch (modeId) {
-    case "diagnose": await workflow.diagnose(input, tenant); break;
-    case "debug":    await workflow.debug(input, tenant, {}); break;
-    case "ask":      await workflow.ask(input, tenant); break;
-    case "create":   await workflow.createOrUpdate(input, tenant); break;
-    case "plan":     await workflow.planOnly(input, tenant); break;
-    case "apply":    await workflow.applyExisting(input, tenant); break;
-    default: throw new Error(`Unknown mode: ${modeId}`);
+    case "ask":
+      await workflow.ask(input, tenant, undefined, r);
+      break;
+    case "diagnose":
+      await workflow.diagnose(input, tenant, undefined, r);
+      break;
+    case "plan:create":
+      if (engine === "aws") {
+        await workflow.createWithAwsSdk(input, tenant);
+      } else {
+        await workflow.createOrUpdate(input, tenant);
+      }
+      break;
+    case "plan:dryrun":
+      await workflow.planOnly(input, tenant);
+      break;
+    case "plan:apply":
+      await workflow.applyExisting(input, tenant);
+      break;
+    default:
+      throw new Error(`Unknown mode: ${modeId}`);
   }
 }
 
 function getModePrompt(modeId: string): string {
   switch (modeId) {
-    case "diagnose": return "Your question";
-    case "debug":    return "Service name";
-    case "ask":      return "Your question";
-    case "create":
-    case "apply":
-    case "plan":     return "Describe the infrastructure";
-    default:         return "Input";
+    case "ask":         return "Your question";
+    case "diagnose":    return "What are you investigating?";
+    case "plan:create": return "Describe the infrastructure to create";
+    case "plan:dryrun": return "Describe the change (dry run)";
+    case "plan:apply":  return "Describe the change to apply";
+    default:            return "Input";
   }
 }
 
-function getModeHint(mode: MenuItem, model: MenuItem): string {
+function getModeHint(mode: MenuItem, model: MenuItem, reasoning: MenuItem): string {
+  const status    = `${c.dim("mode:")} ${c.cyan(mode.label)}  ${c.dim("model:")} ${c.cyan(model.label)}  ${c.dim("reasoning:")} ${c.cyan(reasoning.label)}`;
   const switchHint = c.dim(`  /mode · /model · /switch to change    /exit to quit`);
-  const modeStatus = `${c.dim("mode:")} ${c.cyan(mode.label)}  ${c.dim("model:")} ${c.cyan(model.label)}`;
 
   let example = "";
   switch (mode.id) {
-    case "diagnose": example = 'e.g. "why is mimir crashing?"'; break;
-    case "debug":    example = 'e.g. checkout-api'; break;
-    case "ask":      example = 'e.g. "how many EC2 instances in us-east-1?"'; break;
-    case "create":   example = 'e.g. "deploy an EKS cluster with 3 nodes"'; break;
-    case "plan":     example = 'e.g. "create an RDS PostgreSQL 15 instance"'; break;
-    case "apply":    example = 'e.g. "add a Lambda function with S3 trigger"'; break;
+    case "ask":         example = 'e.g. "how many EKS clusters in ap-south-1?"'; break;
+    case "diagnose":    example = 'e.g. "why is mimir crashing?"'; break;
+    case "plan:create": example = 'e.g. "create RDS PostgreSQL t3.medium"'; break;
+    case "plan:dryrun": example = 'e.g. "add node group to EKS"'; break;
+    case "plan:apply":  example = 'e.g. "increase ECS replica count to 4"'; break;
   }
 
-  return `${modeStatus}   ${c.dim(example)}\n${switchHint}`;
+  return `${status}   ${c.dim(example)}\n${switchHint}`;
 }
 
-// ─── Mode + model selection (with back-navigation support) ───────────────────
+// ─── Mode + model + reasoning picker (with back-navigation) ──────────────────
 
-async function pickModeAndModel(): Promise<{ mode: MenuItem; model: MenuItem }> {
-  // Loop until both mode and model are confirmed.
-  // Pressing back on model returns to mode selection.
-  // Pressing back on mode has nowhere to go — ignored.
+async function pickSession(): Promise<{ mode: MenuItem; model: MenuItem; reasoning: MenuItem; engine: MenuItem }> {
   while (true) {
     const mode = await selectMenu("Mode", MODES, false);
-    if (!mode) continue; // can't go back further than mode
+    if (!mode) continue;
+
+    // Plan commands need an engine selection
+    let engine = ENGINE[0]; // default terraform
+    if (mode.id === "plan:create" || mode.id === "plan:apply") {
+      while (true) {
+        const picked = await selectMenu("Engine", ENGINE, true);
+        if (!picked) break; // go back to mode
+        engine = picked;
+        break;
+      }
+      // If user backed out of engine, re-pick mode
+      if (engine === ENGINE[0] && mode.id === "plan:apply") { /* ok, terraform default */ }
+    }
 
     while (true) {
-      const model = await selectMenu("Model", MODELS, true);
-      if (!model) break; // go back to mode selection
+      const reasoning = await selectMenu("Reasoning depth", REASONING, true);
+      if (!reasoning) break; // go back to mode
 
-      return { mode, model };
+      while (true) {
+        const model = await selectMenu("Model", MODELS, true);
+        if (!model) break; // go back to reasoning
+
+        return { mode, model, reasoning, engine };
+      }
     }
   }
 }
@@ -261,10 +291,10 @@ function printSessionHeader(tenant: TenantContext): void {
   console.log("");
   printBoxHeader("infra-copilot  ·  v1.0.0");
   console.log("");
-  printKV("Tenant",  tenant.tenantId,        { keyWidth: 10 });
-  printKV("User",    tenant.userId,           { keyWidth: 10 });
-  printKV("Region",  c.cyan(tenant.awsRegion), { keyWidth: 10 });
-  printKV("Tier",    c.dim(tenant.subscriptionTier), { keyWidth: 10 });
+  printKV("Tenant", tenant.tenantId,              { keyWidth: 10 });
+  printKV("User",   tenant.userId,                { keyWidth: 10 });
+  printKV("Region", c.cyan(tenant.awsRegion),     { keyWidth: 10 });
+  printKV("Tier",   c.dim(tenant.subscriptionTier), { keyWidth: 10 });
   console.log("");
 }
 
@@ -276,43 +306,35 @@ export async function runInteractiveSession(
 ): Promise<void> {
   printSessionHeader(tenant);
 
-  let { mode, model } = await pickModeAndModel();
+  let { mode, model, reasoning, engine } = await pickSession();
 
   console.log("");
-  printKV("Mode",  c.bold(mode.label),  { keyWidth: 8 });
-  printKV("Model", c.bold(model.label), { keyWidth: 8 });
+  printKV("Mode",      c.bold(mode.label),      { keyWidth: 12 });
+  printKV("Reasoning", c.bold(reasoning.label), { keyWidth: 12 });
+  printKV("Model",     c.bold(model.label),      { keyWidth: 12 });
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
-    // 1. Input — show current mode/model and slash-command hints.
-    const input = await textInput(getModePrompt(mode.id), getModeHint(mode, model));
+    const input = await textInput(getModePrompt(mode.id), getModeHint(mode, model, reasoning));
 
-    // Slash commands to switch mode / model mid-session.
-    if (input === "/exit" || input === "/quit") {
-      break;
-    }
+    if (input === "/exit" || input === "/quit") break;
+
     if (input === "/mode" || input === "/m") {
       const picked = await selectMenu("Mode", MODES, false);
-      if (picked) {
-        mode = picked;
-        printKV("Mode", c.bold(mode.label), { keyWidth: 8 });
-      }
+      if (picked) { mode = picked; printKV("Mode", c.bold(mode.label), { keyWidth: 12 }); }
       continue;
     }
     if (input === "/model" || input === "/llm") {
       const picked = await selectMenu("Model", MODELS, true);
-      if (picked) {
-        model = picked;
-        printKV("Model", c.bold(model.label), { keyWidth: 8 });
-      }
+      if (picked) { model = picked; printKV("Model", c.bold(model.label), { keyWidth: 12 }); }
       continue;
     }
     if (input === "/switch" || input === "/s") {
-      const picked = await pickModeAndModel();
-      mode  = picked.mode;
-      model = picked.model;
-      printKV("Mode",  c.bold(mode.label),  { keyWidth: 8 });
-      printKV("Model", c.bold(model.label), { keyWidth: 8 });
+      const picked = await pickSession();
+      mode = picked.mode; model = picked.model; reasoning = picked.reasoning; engine = picked.engine;
+      printKV("Mode",      c.bold(mode.label),      { keyWidth: 12 });
+      printKV("Reasoning", c.bold(reasoning.label), { keyWidth: 12 });
+      printKV("Model",     c.bold(model.label),      { keyWidth: 12 });
       continue;
     }
 
@@ -321,21 +343,17 @@ export async function runInteractiveSession(
       continue;
     }
 
-    // 2. Execute with per-run telemetry collector.
     const telemetry = new TelemetryCollector(uuidv4());
     const workflow  = makeWorkflowFn(tenant.awsRegion, model.id, telemetry);
 
     try {
-      await executeMode(workflow, mode.id, input, tenant);
+      await executeMode(workflow, mode.id, engine.id, reasoning.id, input, tenant);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       console.log(`\n  ${c.red(sym.cross)} ${c.red("Error:")}  ${msg}`);
     }
 
-    // Show question recap so it's visible next to the answer before telemetry.
     console.log(`\n  ${c.dim("Q:")}  ${c.bold(input)}`);
-
-    // 3. Telemetry panel — then loop straight back to input (no extra Enter needed).
     printTelemetry(telemetry, mode.label, model.label);
     console.log("");
   }

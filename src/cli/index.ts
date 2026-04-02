@@ -2,6 +2,8 @@
 import { Command } from "commander";
 import { cwd } from "node:process";
 import * as os from "node:os";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { ClarifyAgent } from "../agents/clarifyAgent";
 import { PlannerAgent } from "../agents/plannerAgent";
 import { AwsPlannerAgent } from "../agents/awsPlannerAgent";
@@ -23,6 +25,24 @@ import { TelemetryCollector } from "../services/telemetryCollector";
 
 const log = createLogger({ component: "cli" });
 
+// ─── AWS profile region resolution ───────────────────────────────────────────
+
+function regionFromAwsProfile(): string | undefined {
+  try {
+    const profile = process.env.AWS_PROFILE ?? process.env.AWS_DEFAULT_PROFILE ?? "default";
+    const configPath = process.env.AWS_CONFIG_FILE ?? join(os.homedir(), ".aws", "config");
+    const content = readFileSync(configPath, "utf-8");
+    const header = profile === "default" ? "\\[default\\]" : `\\[profile ${profile}\\]`;
+    const sectionMatch = new RegExp(`${header}([\\s\\S]*?)(?=\\[|$)`).exec(content);
+    if (!sectionMatch) return undefined;
+    const regionMatch = /^\s*region\s*=\s*(.+)$/m.exec(sectionMatch[1]);
+    return regionMatch?.[1].trim();
+  } catch {
+    return undefined;
+  }
+}
+
+// ─── Workflow factory ─────────────────────────────────────────────────────────
 
 function makeWorkflow(
   region: string,
@@ -30,55 +50,48 @@ function makeWorkflow(
   telemetry?: TelemetryCollector,
   bedrockCredentials?: { accessKeyId: string; secretAccessKey: string; sessionToken?: string },
 ): InfraWorkflow {
-  const bedrock = new BedrockService(region, modelId, telemetry, bedrockCredentials);
-  const clarifyAgent = new ClarifyAgent(bedrock);
-  const plannerAgent = new PlannerAgent(bedrock);
+  const bedrock       = new BedrockService(region, modelId, telemetry, bedrockCredentials);
+  const clarifyAgent  = new ClarifyAgent(bedrock);
+  const plannerAgent  = new PlannerAgent(bedrock);
   const awsPlannerAgent = new AwsPlannerAgent(bedrock);
-  const terraformMcp = new TerraformMcpService(cwd());
+  const terraformMcp  = new TerraformMcpService(cwd());
   const executorAgent = new ExecutorAgent(terraformMcp);
-  const awsMcp = new AwsMcpService();
-  const askAgent = new AskAgent(bedrock, awsMcp);
+  const awsMcp        = new AwsMcpService();
+  const askAgent      = new AskAgent(bedrock, awsMcp);
   const diagnoseAgent = new DiagnoseAgent(bedrock, awsMcp);
   const registryClient = new TerraformRegistryClient();
   return new InfraWorkflow(
-    clarifyAgent,
-    plannerAgent,
-    awsPlannerAgent,
-    executorAgent,
-    diagnoseAgent,
-    askAgent,
-    registryClient,
-    terraformMcp,
-    new RateLimiterService(),
-    new SubscriptionService(),
-    new TracingService(),
+    clarifyAgent, plannerAgent, awsPlannerAgent, executorAgent,
+    diagnoseAgent, askAgent, registryClient, terraformMcp,
+    new RateLimiterService(), new SubscriptionService(), new TracingService(),
   );
 }
+
+// ─── CLI ──────────────────────────────────────────────────────────────────────
 
 async function run(): Promise<void> {
   const program = new Command();
   program.name("infra").description("infra-copilot CLI").version("1.0.0");
 
-  // Global options for proper multi-tenant controls.
+  // ── Global options ──────────────────────────────────────────────────────────
   program
-    .option("--tenant-id <tenantId>", "tenant identifier", process.env.TENANT_ID)
-    .option("--user-id <userId>", "user identifier", process.env.USER_ID)
-    .option("--subscription <tier>", "free|pro|enterprise", process.env.SUBSCRIPTION_TIER ?? "pro")
-    .option("--region <awsRegion>", "AWS region", process.env.AWS_REGION ?? "us-east-1")
-    // Bedrock credentials — for all LLM calls (the account where Bedrock models are deployed)
-    .option("--bedrock-access-key-id <keyId>", "Access key ID for the Bedrock AWS account", process.env.BEDROCK_ACCESS_KEY_ID)
-    .option("--bedrock-secret-access-key <secret>", "Secret access key for the Bedrock AWS account", process.env.BEDROCK_SECRET_ACCESS_KEY)
-    .option("--bedrock-session-token <token>", "Session token for the Bedrock AWS account (SSO / temporary credentials)", process.env.BEDROCK_SESSION_TOKEN)
-    // Tenant credentials — for the account being investigated/managed (CloudWatch, CloudControl, etc.)
-    .option("--aws-access-key-id <keyId>", "Access key ID for the tenant AWS account", process.env.TENANT_AWS_ACCESS_KEY_ID)
-    .option("--aws-secret-access-key <secret>", "Secret access key for the tenant AWS account", process.env.TENANT_AWS_SECRET_ACCESS_KEY)
-    .option("--aws-session-token <token>", "Session token for the tenant AWS account (SSO / temporary credentials)", process.env.TENANT_AWS_SESSION_TOKEN)
-    .option("--log-level <level>", "debug|info|warn|error", getConfiguredLogLevel())
-    .option("--tf-dir <path>", "path to existing Terraform directory (triggers update flow)")
-    .option("-i, --input <instruction>", "plain-language change description (used with --tf-dir)")
-    .option("--engine <engine>", "terraform|aws  — execution engine for create/plan commands", "terraform");
-
-  const tenantService = new TenantService();
+    .option("--tenant-id <id>",    "tenant identifier",            process.env.TENANT_ID)
+    .option("--user-id <id>",      "user identifier",              process.env.USER_ID)
+    .option("--subscription <tier>", "free|pro|enterprise",        process.env.SUBSCRIPTION_TIER ?? "pro")
+    .option("--region <region>",   "AWS region",
+      process.env.AWS_REGION ?? process.env.AWS_DEFAULT_REGION ?? regionFromAwsProfile() ?? "ap-south-1")
+    // Bedrock LLM credentials
+    .option("--bedrock-access-key-id <key>",     "Bedrock account access key",    process.env.BEDROCK_ACCESS_KEY_ID)
+    .option("--bedrock-secret-access-key <key>", "Bedrock account secret key",    process.env.BEDROCK_SECRET_ACCESS_KEY)
+    .option("--bedrock-session-token <token>",   "Bedrock account session token", process.env.BEDROCK_SESSION_TOKEN)
+    // Tenant (infrastructure) credentials
+    .option("--aws-access-key-id <key>",     "Tenant AWS access key",    process.env.TENANT_AWS_ACCESS_KEY_ID)
+    .option("--aws-secret-access-key <key>", "Tenant AWS secret key",    process.env.TENANT_AWS_SECRET_ACCESS_KEY)
+    .option("--aws-session-token <token>",   "Tenant AWS session token", process.env.TENANT_AWS_SESSION_TOKEN)
+    // LLM tuning
+    .option("--model <modelId>",     "Bedrock model ID",                                       process.env.BEDROCK_MODEL_ID)
+    .option("--reasoning <depth>",   "quick (8 steps) | standard (25) | deep (40)",            "standard")
+    .option("--log-level <level>",   "debug | info | warn | error",                            getConfiguredLogLevel());
 
   type GlobalOpts = {
     tenantId?: string;
@@ -91,181 +104,132 @@ async function run(): Promise<void> {
     awsAccessKeyId?: string;
     awsSecretAccessKey?: string;
     awsSessionToken?: string;
+    model?: string;
+    reasoning: "quick" | "standard" | "deep";
     logLevel: "debug" | "info" | "warn" | "error";
-    tfDir?: string;
-    input?: string;
-    engine: "terraform" | "aws";
   };
 
-  /** Tenant context — carries the investigated account's credentials. */
-  const buildTenant = (): ReturnType<TenantService["buildContext"]> => {
+  const tenantService = new TenantService();
+
+  const buildTenant = () => {
     const opts = program.opts<GlobalOpts>();
     process.env.LOG_LEVEL = opts.logLevel;
-    const awsCredentials =
-      opts.awsAccessKeyId && opts.awsSecretAccessKey
-        ? { accessKeyId: opts.awsAccessKeyId, secretAccessKey: opts.awsSecretAccessKey, sessionToken: opts.awsSessionToken }
-        : undefined;
-    // TENANT_ID and USER_ID are optional — default to local machine identity
-    // so the tool works out-of-the-box without any env vars configured.
-    const tenantId = opts.tenantId ?? process.env.TENANT_ID ?? "local";
-    const userId   = opts.userId   ?? process.env.USER_ID   ?? os.userInfo().username;
+    const awsCredentials = opts.awsAccessKeyId && opts.awsSecretAccessKey
+      ? { accessKeyId: opts.awsAccessKeyId, secretAccessKey: opts.awsSecretAccessKey, sessionToken: opts.awsSessionToken }
+      : undefined;
     return tenantService.buildContext({
-      tenantId,
-      userId,
+      tenantId:         opts.tenantId ?? process.env.TENANT_ID ?? "local",
+      userId:           opts.userId   ?? process.env.USER_ID   ?? os.userInfo().username,
       subscriptionTier: opts.subscription,
-      awsRegion: opts.region,
+      awsRegion:        opts.region,
       awsCredentials,
     });
   };
 
-  /** Bedrock credentials — for the account where LLMs are deployed. */
-  const bedrockCreds = (): { accessKeyId: string; secretAccessKey: string; sessionToken?: string } | undefined => {
+  const bedrockCreds = () => {
     const opts = program.opts<GlobalOpts>();
     return opts.bedrockAccessKeyId && opts.bedrockSecretAccessKey
       ? { accessKeyId: opts.bedrockAccessKeyId, secretAccessKey: opts.bedrockSecretAccessKey, sessionToken: opts.bedrockSessionToken }
       : undefined;
   };
 
-  program
-    .command("create")
-    .description("Parse intent, generate plan, ask approval, then execute.")
-    .action(async () => {
-      const opts = program.opts<{ input?: string; engine: "terraform" | "aws" }>();
-      if (!opts.input) {
-        console.error("--input <intent> is required for the create command");
-        process.exitCode = 1;
-        return;
-      }
-      const tenant = buildTenant();
-      const workflow = makeWorkflow(tenant.awsRegion, undefined, undefined, bedrockCreds());
-      if (opts.engine === "aws") {
-        await workflow.createWithAwsSdk(opts.input, tenant);
-      } else {
-        await workflow.createOrUpdate(opts.input, tenant);
-      }
-    });
+  const modelId   = () => program.opts<GlobalOpts>().model;
+  const reasoning = () => program.opts<GlobalOpts>().reasoning;
 
-  program
-    .command("plan")
-    .description("Generate and run terraform plan only.")
-    .action(async () => {
-      const opts = program.opts<{ input?: string }>();
-      if (!opts.input) {
-        console.error("--input <intent> is required for the plan command");
-        process.exitCode = 1;
-        return;
-      }
-      const tenant = buildTenant();
-      const workflow = makeWorkflow(tenant.awsRegion, undefined, undefined, bedrockCreds());
-      await workflow.planOnly(opts.input, tenant);
-    });
-
-  program
-    .command("update")
-    .description("Read an existing Terraform directory, patch files with LLM, then plan & apply.")
-    .action(async () => {
-      const { resolve } = await import("node:path");
-      const opts = program.opts<{ tfDir?: string; input?: string }>();
-      if (!opts.tfDir) {
-        console.error("--tf-dir <path> is required for the update command");
-        process.exitCode = 1;
-        return;
-      }
-      if (!opts.input) {
-        console.error("--input <instruction> is required for the update command");
-        process.exitCode = 1;
-        return;
-      }
-      const tenant = buildTenant();
-      const workflow = makeWorkflow(tenant.awsRegion, undefined, undefined, bedrockCreds());
-      await workflow.updateExisting(opts.input, resolve(opts.tfDir), tenant);
-    });
-
-  program
-    .command("apply")
-    .description("Generate plan and apply only after confirmation.")
-    .action(async () => {
-      const opts = program.opts<{ input?: string }>();
-      if (!opts.input) {
-        console.error("--input <intent> is required for the apply command");
-        process.exitCode = 1;
-        return;
-      }
-      const tenant = buildTenant();
-      const workflow = makeWorkflow(tenant.awsRegion, undefined, undefined, bedrockCreds());
-      await workflow.applyExisting(opts.input, tenant);
-    });
+  // ── ask ─────────────────────────────────────────────────────────────────────
+  // Simple Q&A: inventory questions, resource counts, status checks.
 
   program
     .command("ask")
-    .description("Answer AWS inventory questions from live AWS account data.")
-    .requiredOption("-q, --question <question>", "question about your AWS account")
-    .option("--k8s-context <context>", "kubectl context name (default: current context)")
+    .description("Ask a plain-English question about your AWS/K8s environment.")
+    .requiredOption("-q, --question <question>", "e.g. \"how many EKS clusters?\"")
+    .option("--k8s-context <context>", "kubectl context (default: current context)")
     .action(async (cmd) => {
       const tenant = buildTenant();
-      const workflow = makeWorkflow(tenant.awsRegion, undefined, undefined, bedrockCreds());
-      await workflow.ask(cmd.question, tenant, cmd.k8sContext);
+      const workflow = makeWorkflow(tenant.awsRegion, modelId(), undefined, bedrockCreds());
+      await workflow.ask(cmd.question, tenant, cmd.k8sContext, reasoning());
     });
 
-  program
-    .command("debug")
-    .description("Collect observability signals from all configured sources and analyze with LLM.")
-    .requiredOption("-s, --service <serviceName>", "service / workload name to debug")
-    .option("-n, --namespace <namespace>", "Kubernetes namespace (default: default)")
-    .option("--since <duration>", "look-back window: 30m | 1h | 6h | 24h (default: 1h)")
-    .option("--tail <lines>", "max log lines per source", "50")
-    .option("--log-groups <groups>", "comma-separated CloudWatch log group names (overrides auto-discovery)")
-    .option("--loki-url <url>", "Loki base URL, e.g. http://loki.monitoring:3100")
-    .option("--opensearch-url <url>", "OpenSearch/Elasticsearch base URL, e.g. https://opensearch:9200")
-    .option("--opensearch-index <pattern>", "OpenSearch index pattern (default: *)")
-    .option("--opensearch-user <user>", "OpenSearch basic-auth username")
-    .option("--opensearch-pass <pass>", "OpenSearch basic-auth password")
-    .option("--k8s-context <context>", "kubectl context name (default: current context)")
-    .action(async (cmd) => {
-      const tenant = buildTenant();
-      const workflow = makeWorkflow(tenant.awsRegion, undefined, undefined, bedrockCreds());
-      await workflow.debug(cmd.service, tenant, {
-        namespace: cmd.namespace,
-        since: cmd.since,
-        tailLines: cmd.tail ? parseInt(cmd.tail, 10) : undefined,
-        logGroups: cmd.logGroups ? (cmd.logGroups as string).split(",").map((s: string) => s.trim()) : undefined,
-        lokiUrl: cmd.lokiUrl,
-        openSearchUrl: cmd.opensearchUrl,
-        openSearchIndex: cmd.opensearchIndex,
-        openSearchUser: cmd.opensearchUser,
-        openSearchPass: cmd.opensearchPass,
-        k8sContext: cmd.k8sContext,
-      });
-    });
+  // ── diagnose ─────────────────────────────────────────────────────────────────
+  // Deep incident investigation: root cause analysis across AWS, K8s, logs.
 
   program
     .command("diagnose")
-    .description("Ask a plain-English question — auto-discovers the service across k8s, CloudWatch, Loki, and OpenSearch.")
-    .requiredOption("-q, --question <question>", 'e.g. "why is mimir crashing?"')
-    .option("--k8s-context <context>", "kubectl context name (default: current context)")
+    .description("Deep investigation of incidents, failures, and performance issues.")
+    .requiredOption("-q, --question <question>", "e.g. \"why is mimir crashing?\"")
+    .option("--k8s-context <context>",    "kubectl context (default: current context)")
+    .option("-n, --namespace <ns>",       "Kubernetes namespace to focus on")
+    .option("--since <duration>",         "look-back window: 30m | 1h | 6h | 24h (default: 1h)")
+    .option("--tail <lines>",             "max log lines per source",                "50")
+    .option("--log-groups <groups>",      "comma-separated CloudWatch log group names")
+    .option("--loki-url <url>",           "Loki base URL, e.g. http://loki:3100")
+    .option("--opensearch-url <url>",     "OpenSearch base URL")
+    .option("--opensearch-index <pattern>","OpenSearch index pattern (default: *)")
+    .option("--opensearch-user <user>",   "OpenSearch basic-auth username")
+    .option("--opensearch-pass <pass>",   "OpenSearch basic-auth password")
     .action(async (cmd) => {
       const tenant = buildTenant();
-      const workflow = makeWorkflow(tenant.awsRegion, undefined, undefined, bedrockCreds());
-      await workflow.diagnose(cmd.question, tenant, cmd.k8sContext);
+      const workflow = makeWorkflow(tenant.awsRegion, modelId(), undefined, bedrockCreds());
+      await workflow.diagnose(cmd.question, tenant, cmd.k8sContext, reasoning());
     });
 
-  // Default action — if --tf-dir is set, run update flow; otherwise launch interactive session.
-  program.action(async () => {
-    const opts = program.opts<{ tfDir?: string; input?: string }>();
-    const tenant = buildTenant();
-    if (opts.tfDir) {
-      const { resolve } = await import("node:path");
-      const instruction = opts.input ?? "";
-      if (!instruction) {
-        console.error("--input <instruction> is required when using --tf-dir");
-        process.exitCode = 1;
-        return;
+  // ── plan ─────────────────────────────────────────────────────────────────────
+  // Infrastructure management: create, dry-run, apply.
+
+  const planCmd = program
+    .command("plan")
+    .description("Infrastructure planning and execution. Use a subcommand: create | dry-run | apply");
+
+  // plan create
+  planCmd
+    .command("create")
+    .description("Generate an infrastructure plan and apply after confirmation.")
+    .requiredOption("-i, --input <instruction>", "plain-language intent, e.g. \"create RDS PostgreSQL\"")
+    .option("--mode <engine>", "aws | terraform", "terraform")
+    .action(async (cmd) => {
+      const tenant = buildTenant();
+      const workflow = makeWorkflow(tenant.awsRegion, modelId(), undefined, bedrockCreds());
+      if (cmd.mode === "aws") {
+        await workflow.createWithAwsSdk(cmd.input, tenant);
+      } else {
+        await workflow.createOrUpdate(cmd.input, tenant);
       }
-      const workflow = makeWorkflow(tenant.awsRegion, undefined, undefined, bedrockCreds());
-      await workflow.updateExisting(instruction, resolve(opts.tfDir), tenant);
-      return;
-    }
-    await runInteractiveSession(tenant, (region, modelId, telemetry) => makeWorkflow(region, modelId, telemetry, bedrockCreds()));
+    });
+
+  // plan dry-run
+  planCmd
+    .command("dry-run")
+    .description("Generate a plan and show what would change — no execution.")
+    .requiredOption("-i, --input <instruction>", "plain-language intent")
+    .option("--mode <engine>", "terraform (only option for dry-run)", "terraform")
+    .action(async (cmd) => {
+      const tenant = buildTenant();
+      const workflow = makeWorkflow(tenant.awsRegion, modelId(), undefined, bedrockCreds());
+      await workflow.planOnly(cmd.input, tenant);
+    });
+
+  // plan apply
+  planCmd
+    .command("apply")
+    .description("Apply an infrastructure change (new input or patch an existing Terraform dir).")
+    .requiredOption("-i, --input <instruction>", "plain-language change description")
+    .option("--tf-dir <path>",  "path to existing Terraform directory to patch")
+    .option("--mode <engine>",  "aws | terraform", "terraform")
+    .action(async (cmd) => {
+      const { resolve } = await import("node:path");
+      const tenant = buildTenant();
+      const workflow = makeWorkflow(tenant.awsRegion, modelId(), undefined, bedrockCreds());
+      if (cmd.tfDir) {
+        await workflow.updateExisting(cmd.input, resolve(cmd.tfDir), tenant);
+      } else {
+        await workflow.applyExisting(cmd.input, tenant);
+      }
+    });
+
+  // ── default (interactive) ────────────────────────────────────────────────────
+  program.action(async () => {
+    const tenant = buildTenant();
+    await runInteractiveSession(tenant, (region, mid, telemetry) => makeWorkflow(region, mid, telemetry, bedrockCreds()));
   });
 
   await program.parseAsync(process.argv);
@@ -273,12 +237,8 @@ async function run(): Promise<void> {
 
 run().catch((error: unknown) => {
   const message = error instanceof Error ? error.message : String(error);
-  const stack = error instanceof Error ? error.stack : undefined;
-  log.error("CLI fatal error", {
-    event: "fatal_error",
-    error: message,
-    stack,
-  });
-  console.error(`infra-copilot failed: ${message}`);
+  const stack   = error instanceof Error ? error.stack   : undefined;
+  log.error("CLI fatal error", { event: "fatal_error", error: message, stack });
+  console.error(`infra failed: ${message}`);
   process.exitCode = 1;
 });

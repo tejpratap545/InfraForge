@@ -5,40 +5,80 @@
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │  CLI  (src/cli/index.ts)                                             │
-│  create · plan · apply · update · ask · debug · diagnose             │
-│  Global: --tenant-id · --region · --engine · --tf-dir                │
+│                                                                      │
+│  ask            → simple Q&A about AWS/K8s                          │
+│  diagnose       → deep incident investigation                        │
+│  plan create    → generate + approve + execute new infrastructure    │
+│  plan dry-run   → generate plan, no execution                        │
+│  plan apply     → apply change (new input or patch existing TF dir)  │
+│                                                                      │
+│  Global: --region · --model · --reasoning · --log-level             │
+│          --bedrock-* · --aws-* credentials                           │
 └───────────────────────┬──────────────────────────────────────────────┘
                         │
                         ▼
 ┌──────────────────────────────────────────────────────────────────────┐
 │  InfraWorkflow  (src/workflows/infraWorkflow.ts)                     │
-│  Rate limits · subscription checks · tracing · telemetry             │
-└──┬───────┬───────┬───────┬───────┬───────────────────────────────────┘
-   │       │       │       │       │
-   ▼       ▼       ▼       ▼       ▼
- create  create  update  debug  ask /
-  (tf)  (aws)   (patch)        diagnose
+│  Rate limits · subscription checks · tracing · telemetry            │
+└──┬───────┬──────────────────────────────────────────────────────────┘
+   │       │
+   ▼       ▼
+ask /   plan create / dry-run / apply
+diagnose
 ```
+
+---
+
+## Three Commands
+
+### `ask` — Inventory Q&A
+
+Simple question answering about live AWS and Kubernetes state. Runs a
+ReAct loop of up to 15 steps (quick=5, standard=15, deep=25) using the
+shared tool set. No incident methodology — just find and return data.
+
+```
+infra ask -q "how many EKS clusters in ap-south-1?"
+```
+
+### `diagnose` — Incident Investigation
+
+Deep root cause analysis. Runs a 4-phase investigation (TRIAGE →
+CORRELATE → HYPOTHESIZE → ROOT CAUSE) with up to 40 steps. Accepts all
+observability sources: CloudWatch, K8s, Loki, OpenSearch. K8s context
+is auto-discovered from the current kubectl context if not provided.
+
+```
+infra diagnose -q "why is mimir crashing?" --reasoning deep
+infra diagnose -q "cert expired?" --namespace prod --k8s-context prod-cluster
+```
+
+### `plan` — Infrastructure Management
+
+Three subcommands, each with a `--mode terraform|aws` flag:
+
+| Subcommand | What it does |
+|---|---|
+| `plan create` | Intent → clarify → plan → approve → execute |
+| `plan dry-run` | Intent → clarify → plan → show diff (no apply) |
+| `plan apply` | Intent → apply (new) or patch existing `--tf-dir` → apply |
 
 ---
 
 ## Agentic Design
 
-All agents follow the same **ReAct loop** pattern (Reason + Act):
+All agents follow the **ReAct loop** (Reason + Act):
 
 ```
 while not done:
     LLM receives:  system prompt + tool catalog + evidence board + step history
-    LLM returns:   { thought, tool, params }   ← single call
-                or { thought, calls: [...] }   ← parallel fan-out (up to 8)
-                or { thought, done: true, answer/report/... }
-    Tool(s) execute (parallel when possible), results appended to history
-    Evidence tracker extracts key findings (errors, deploys, crashes)
-    History compressed (last 5 full · older summarised to key lines)
+    LLM returns:   { thought, tool, params }         ← single call
+                or { thought, calls: [...] }          ← parallel fan-out (up to 8)
+                or { thought, done: true, answer }
+    Tool(s) execute (parallel when possible)
+    Evidence tracker extracts key findings
+    History compressed (last 5 steps full · older → 2 key lines each)
 ```
-
-No cases, no pre-wired data sources, no hardcoded field extraction.
-The LLM decides at each step what to run and when it has enough information.
 
 ---
 
@@ -46,12 +86,12 @@ The LLM decides at each step what to run and when it has enough information.
 
 | Agent | Pattern | Responsibility |
 |-------|---------|---------------|
-| `ClarifyAgent` | ReAct · `ask_user` tool | Interactively gathers requirements before planning. LLM asks ONE question at a time and concludes with enriched description + resource types. |
-| `PlannerAgent` | Single LLM call | Enriched description → Terraform HCL files (create) or file patches (update). Uses LCS unified diff for display. |
-| `AwsPlannerAgent` | Single LLM call | Enriched description → Cloud Control API call plan |
-| `ExecutorAgent` | Deterministic | Runs `terraform init / plan / apply` via TerraformMcpService |
-| `DiagnoseAgent` | ReAct · 16 tools · evidence board | Senior SRE investigation engine. 4-phase methodology: TRIAGE → CORRELATE → HYPOTHESIZE → ROOT CAUSE. Up to 25 steps with pattern recognition, anti-pattern guards, and truncation auto-retry. |
-| `AskAgent` | ReAct · 16 tools | LLM answers AWS inventory / metrics / k8s questions by querying live data. No pre-classification. |
+| `ClarifyAgent` | ReAct · `ask_user` tool | Gathers requirements interactively before planning. Asks ONE question at a time, concludes with enriched description + resource types. |
+| `PlannerAgent` | Single LLM call | Enriched description → Terraform HCL files (create) or file patches (update). |
+| `AwsPlannerAgent` | Single LLM call | Enriched description → Cloud Control API call plan. |
+| `ExecutorAgent` | Deterministic | Runs `terraform init / plan / apply` via TerraformMcpService. |
+| `DiagnoseAgent` | ReAct · 16 tools · evidence board | Senior SRE investigation engine. 4-phase methodology. Step limits: quick=8, standard=25, deep=40. |
+| `AskAgent` | ReAct · 16 tools | Answers AWS/K8s inventory questions from live data. Step limits: quick=5, standard=15, deep=25. |
 
 ---
 
@@ -64,57 +104,59 @@ The LLM decides at each step what to run and when it has enough information.
   Phase 1: TRIAGE (step 1 — parallel fan-out 4-6 calls)
   ┌────────────────────────────────────────────────────────────┐
   │  cw_metrics(5XX)    elb_health(lb)    cloudtrail(3h)      │
-  │  cw_metrics(latency) ecs_describe(svc) cw_logs(errors)    │
+  │  cw_metrics(latency) k8s_pods(all-ns)  cw_logs(errors)   │
   └────────────────────────────┬───────────────────────────────┘
                                │
-    Evidence Board auto-extracts: errors, deploys, crashes, spikes
+    Evidence Board auto-extracts: errors, deploys, crashes, K8s signals
                                │
          ▼
   Phase 2: CORRELATE (steps 2-5)
   ┌────────────────────────────────────────────────────────────┐
   │  Align timestamps: when did anomaly start?                 │
   │  Cross-reference: deploy time vs first error               │
-  │  Separate cause from symptom (high CPU = symptom, not root)│
+  │  K8s signals → pivot to scheduling/cert/ingress deep-dive  │
   └────────────────────────────┬───────────────────────────────┘
                                │
          ▼
   Phase 3: HYPOTHESIS (steps 6-12)
   ┌────────────────────────────────────────────────────────────┐
-  │  "I think the new deployment broke health checks because..."│
-  │  Run ONE query to confirm/deny. Pivot if disproved.        │
+  │  State theory in "thought". Run ONE disproof query.        │
+  │  K8s: describe pod/node/ingress/cert as needed.            │
   └────────────────────────────┬───────────────────────────────┘
                                │
          ▼
   Phase 4: ROOT CAUSE (steps 13+)
   ┌────────────────────────────────────────────────────────────┐
-  │  ## Incident Summary (severity, impact, duration)          │
-  │  ## Root Cause (specific component + evidence)             │
-  │  ## Evidence Chain (numbered, timestamped)                  │
-  │  ## Timeline (minute-by-minute)                            │
-  │  ## Remediation (immediate + permanent + prevention)       │
+  │  ## Incident Summary  (severity · impact · duration)       │
+  │  ## Root Cause        (specific component + evidence)      │
+  │  ## Evidence Chain    (numbered, timestamped)              │
+  │  ## Timeline          (minute-by-minute)                   │
+  │  ## Immediate Remediation                                  │
+  │  ## Permanent Fix + Prevention                             │
   └────────────────────────────────────────────────────────────┘
 ```
 
-### Incident Pattern Recognition
+### K8s Signal Detection & Phase Pivots
 
-The agent recognizes 5 common patterns and adjusts its investigation:
+When K8s signals are detected in the evidence board, the phase hint
+switches the agent to a targeted K8s investigation path:
 
-| Pattern | Signal | Verification Tools |
-|---------|--------|-------------------|
-| Deploy-related | Anomaly starts within 30 min of deploy | `cloudtrail` → `ecs_describe` → compare timestamps |
-| Resource exhaustion | Gradual ramp-up, not sudden step | `cw_metrics` time series for ramp pattern |
-| Dependency failure | Connection errors, DNS failures in logs | `cw_logs` → `route53_check` → downstream health |
-| Traffic spike | Sudden request count increase, all targets | `cw_metrics(RequestCount)` → baseline comparison |
-| Single-host/AZ | Errors from specific targets only | `elb_health` → host-level metrics/logs |
+| Signal type | Trigger pattern | Deep-dive focus |
+|---|---|---|
+| `K8S_SCHEDULE` | `0/N nodes are available`, `taint`, `unschedulable` | describe pod, node conditions, taints, resourcequota, FailedScheduling events |
+| `K8S_STUCK` | `ImagePullBackOff`, `ContainerCreating` | describe pod, pull secrets, PVCs |
+| `K8S_NODE` | `MemoryPressure`, `NotReady`, `evict` | describe node, EC2 instance status, top nodes |
+| `K8S_QUOTA` | `exceeded quota`, `limitrange` | describe resourcequota, limitrange, top pods |
+| `K8S_INGRESS` | `no endpoints available`, `upstream error`, ingress 502/503 | describe ingress, get endpoints, svc selector, ingress controller health |
+| `K8S_CERT` | `certificate expired`, `x509`, `acme error`, `challenge failed` | get/describe certificate, certificaterequest, challenge, cert-manager logs |
 
 ### Evidence Board
 
-Auto-extracts key findings from every tool result:
-- **Critical**: 5XX errors, CrashLoopBackOff, OOMKilled, unhealthy targets, stopped tasks
+Auto-extracted from every tool result and presented to the LLM at every step:
+
+- **Critical**: 5XX errors, CrashLoop, OOMKilled, unhealthy targets, stopped tasks, K8s scheduling/cert/ingress failures
 - **Warning**: Deployments, config changes, scaling events
 - **Info**: Metric summaries (max/avg values)
-
-Presented to the LLM at every step so it never loses important signals during history compression.
 
 ---
 
@@ -122,44 +164,47 @@ Presented to the LLM at every step so it never loses important signals during hi
 
 ### Core Tools
 
-| Tool | What it does | SDK |
-|------|-------------|-----|
-| `run_command(command)` | Any read-only shell cmd: `dig`, `curl`, `nc`, `traceroute` | child_process |
-| `aws_query(type, ...)` | List AWS resources via Cloud Control SDK | @aws-sdk/client-cloudcontrol |
-| `aws_get(type, id, ...)` | Fetch full properties of one AWS resource | @aws-sdk/client-cloudcontrol |
-| `ec2_exec(instance_id, cmd)` | Run command inside EC2 via SSM SDK (no SSH/CLI needed) | @aws-sdk/client-ssm |
+| Tool | What it does |
+|------|-------------|
+| `run_command(command)` | Any read-only shell cmd: `kubectl describe`, `dig`, `curl`, `nc` |
+| `aws_query(type, ...)` | List AWS resources via Cloud Control SDK |
+| `aws_get(type, id, ...)` | Fetch full properties of one AWS resource |
+| `ec2_exec(instance_id, cmd)` | Run command inside EC2 via SSM (no SSH needed) |
+| `aws_cli(command)` | Read-only AWS CLI commands (credentials auto-injected) |
 
-### AWS Observability Tools
+### AWS Observability
 
-| Tool | What it does | SDK |
-|------|-------------|-----|
-| `cw_metrics(namespace, metric, ...)` | CloudWatch metric statistics (any unit — not restricted to Percent) | @aws-sdk/client-cloudwatch |
-| `cw_logs(log_group, ...)` | CloudWatch Logs search (up to 100 events) | @aws-sdk/client-cloudwatch-logs |
-| `pi_top_sql(instance, ...)` | Performance Insights — top SQL by DB load (AAS) | @aws-sdk/client-pi |
+| Tool | What it does |
+|------|-------------|
+| `cw_metrics(namespace, metric, ...)` | CloudWatch metric statistics (any unit) |
+| `cw_logs(log_group, ...)` | CloudWatch Logs search |
+| `pi_top_sql(instance, ...)` | Performance Insights — top SQL by DB load |
 
-### AWS Infrastructure Tools
+### AWS Infrastructure
 
-| Tool | What it does | SDK |
-|------|-------------|-----|
-| `ecs_describe(cluster?, service?, task_id?)` | ECS clusters → services → tasks with deployments, events, stopped reasons | @aws-sdk/client-ecs |
-| `elb_health(load_balancer?, target_group?)` | ALB/NLB target group health with reasons | @aws-sdk/client-elastic-load-balancing-v2 |
-| `cloudtrail(event_name?, resource_name?, ...)` | Recent AWS API events — deploys, config changes | @aws-sdk/client-cloudtrail |
-| `asg_activity(asg_name?)` | Auto Scaling group config + scaling history | @aws-sdk/client-auto-scaling |
-| `route53_check(domain?, zone_id?)` | Route 53 DNS record lookup | @aws-sdk/client-route-53 |
+| Tool | What it does |
+|------|-------------|
+| `ecs_describe(cluster?, service?, task_id?)` | ECS clusters → services → tasks with events, stopped reasons |
+| `elb_health(load_balancer?, target_group?)` | ALB/NLB target group health |
+| `cloudtrail(event_name?, resource_name?, ...)` | Recent AWS API events — deploys, config changes |
+| `asg_activity(asg_name?)` | Auto Scaling group config + scaling history |
+| `route53_check(domain?, zone_id?)` | Route 53 DNS record lookup |
 
-### Kubernetes Tools
+### Kubernetes
 
-| Tool | What it does | Source |
-|------|-------------|-------|
-| `k8s_pods(namespace?, selector?)` | Structured pod status: CrashLoop, OOM, restarts, exit codes | kubectl JSON |
-| `k8s_events(namespace?, severity?, since?)` | Cluster events with severity filtering | kubectl JSON |
-| `k8s_logs(pod, namespace?, grep?, previous?)` | Pod log search with grep, crashed container support | kubectl logs |
+| Tool | What it does |
+|------|-------------|
+| `k8s_pods(namespace?, selector?)` | Structured pod status: CrashLoop, OOM, restarts, exit codes |
+| `k8s_events(namespace?, severity?, since?)` | Cluster events with severity filtering |
+| `k8s_logs(pod, namespace?, grep?, previous?)` | Pod log search with grep, crashed container support |
 
-### MCP Tools
+K8s context is auto-discovered from `kubectl config current-context` when `--k8s-context` is not provided.
 
-| Tool | What it does | Transport |
-|------|-------------|-----------|
-| `mcp_tool(name, ...args)` | Route to any connected AWS MCP server tool | stdio/HTTP |
+### MCP
+
+| Tool | What it does |
+|------|-------------|
+| `mcp_tool(name, ...args)` | Route to any connected AWS MCP server tool |
 
 ### MCP Server Catalog (30+ available)
 
@@ -177,152 +222,98 @@ Cost          : cost
 
 ---
 
-## Flow: `create --engine terraform` (default)
+## Flow: `plan create --mode terraform`
 
 ```
 User: "create an RDS PostgreSQL instance"
          │
          ▼
-  ClarifyAgent.run()                        ← ReAct loop
+  ClarifyAgent.run()                         ← ReAct loop
     LLM asks: "What instance class?"
-    LLM asks: "What is the database name?"
     LLM concludes: enriched_instruction + resource_types
          │
          ▼
-  TerraformRegistryClient                   ← schemas for detected resource types
-         │  ProviderSchema[] (optional — registry may be unavailable)
+  TerraformRegistryClient                    ← schemas for resource types
+         │
          ▼
   PlannerAgent.generatePlanFromDescription()
          │  InfraPlan { summary, steps[], terraform.files{} }
          ▼
-  print plan summary + risk badges
+  print plan summary + diff
          │
-         ▼
   ┌─ approved? ─┐
-  │ no → exit   │ yes
+  │ no → exit   │ yes → ExecutorAgent → terraform init + plan + apply
   └─────────────┘
-         │
-         ▼
-  ExecutorAgent.execute()
-    ├── materializePlan()  →  tenants/<id>/plans/<planId>/*.tf
-    ├── runPlan()          →  terraform init + plan
-    └── runApply()         →  terraform apply
 ```
 
----
-
-## Flow: `create --engine aws`
+## Flow: `plan create --mode aws`
 
 ```
 User: "create an S3 bucket"
          │
-         ▼
-  ClarifyAgent.run()                        ← ReAct loop, same as above
-         │  enrichedInstruction
-         ▼
-  AwsPlannerAgent.generatePlan(description)
+  ClarifyAgent.run()
+         │
+  AwsPlannerAgent.generatePlan()
          │  AwsExecutionPlan { calls: [{ typeName, operation, desiredState }] }
          ▼
-  print Cloud Control call list
-         │
-         ▼
   ┌─ approved? ─┐
-  │ no → exit   │ yes
+  │ no → exit   │ yes → CreateResourceCommand → poll → SUCCESS/FAILED
   └─────────────┘
-         │
-         ▼
-  AwsExecutorService.execute()  (sequential)
-    └── for each CloudControlCall:
-          CreateResourceCommand
-              │
-              ▼
-          poll GetResourceRequestStatus
-              │
-          SUCCESS → next call
-          FAILED  → stop
 ```
 
----
-
-## Flow: `update --tf-dir <path>` (SRE patch)
+## Flow: `plan apply --tf-dir <path>`
 
 ```
 Existing ./infra/*.tf
          │
-         ▼
-  TerraformMcpService.readExistingFiles()   ← all .tf / .tfvars
+  TerraformMcpService.readExistingFiles()
          │
-         ▼
-  ClarifyAgent.run(instruction, existingFiles)  ← ReAct loop
-    LLM sees existing files as context — won't re-ask what's already defined
+  ClarifyAgent.run(instruction, existingFiles)
          │
-         ▼
-  PlannerAgent.patchExisting(existingFiles, enrichedInstruction)
-    ├── Edit existing file if change fits naturally
-    ├── Create new file if resource is self-contained
-    └── Returns ONLY changed/new files — unchanged files merged automatically
+  PlannerAgent.patchExisting()
+    └── returns ONLY changed/new files
          │
-         ▼
-  print unified diff per file (git-style, 3 lines of context)
+  print unified diff
          │
-         ▼
   approved? → writeFiles() → terraform plan → approved? → terraform apply
 ```
-
----
 
 ## Flow: `diagnose`
 
 ```
-"Why is checkout latency spiking in prod?"
+"Why is mimir not starting?"
          │
-         ▼
-  AwsMcpService.connect()                   ← connect cloudwatch, cloudtrail, etc.
-         │  Discovers 50+ MCP tools dynamically
-         ▼
-  DiagnoseAgent.run()                       ← ReAct loop, up to 25 steps
-    Step 1:  parallel × 6 (TRIAGE)
-               cw_metrics("AWS/ApplicationELB", "HTTPCode_Target_5XX_Count", ...)
-               cw_metrics("AWS/ApplicationELB", "TargetResponseTime", ...)
-               elb_health(load_balancer="checkout-alb")
+  AwsMcpService.connect()         ← connects cloudwatch, cloudtrail, etc.
+         │
+  runPreflight()
+    ├── AWS: sts get-caller-identity
+    └── K8s: kubectl config current-context → kubectl cluster-info (auto-discover)
+         │
+  DiagnoseAgent.run()             ← ReAct loop, up to 40 steps (--reasoning deep)
+    Step 1:  parallel × 4 (TRIAGE)
+               k8s_pods(namespace=mimir)
+               k8s_events(namespace=all, severity=warning)
                cloudtrail(since_hours=3)
-               ecs_describe(cluster="prod", service="checkout-api")
-               cw_logs("/ecs/checkout-api", "ERROR", since_hours=1)
-    ───── Evidence Board: [!!] 417 5XX errors | [!] CHANGE: UpdateService at 10:15 ─────
-    Step 2:  ecs_describe(cluster="prod", service="checkout-api")  ← deployment detail
-    Step 3:  k8s_events(severity="warning", since="2h")
-    Step 4:  cw_metrics("AWS/RDS", "DatabaseConnections", ...)    ← dependency check
-    ...
-    Done:    { done:true, answer: "## Incident Summary\n## Root Cause\n..." }
-         │
-         ▼
-  renderReport()
-    Investigation: 12 tool calls, 8 steps, 14.3s execution time
+               cw_logs(...)
+    ─── Evidence Board: [!!] K8S_SCHEDULE: 0/8 nodes are available ───
+    → Phase pivots to K8S SCHEDULING DEEP-DIVE
+    Step 2:  parallel × 5
+               kubectl describe pod <pod>
+               kubectl get nodes -o wide
+               kubectl describe nodes | grep Conditions/Taints/Allocatable
+               kubectl get resourcequota --all-namespaces
+               kubectl get events --field-selector reason=FailedScheduling
+    Done:    ## Root Cause: nodes have NoSchedule taint, pods missing toleration
 ```
-
----
 
 ## Flow: `ask`
 
 ```
-"How many EKS clusters in ap-south-1?"
+"How many EKS clusters?"
          │
-         ▼
-  AskAgent.run()                            ← ReAct loop, up to 15 steps
-    Step 1:  aws_query("AWS::EKS::Cluster", region="ap-south-1")
-    Done:    { thought, done:true, answer: "You have 2 EKS clusters: ..." }
-         │
-         ▼
-  renderReport()
-
-"What is the health of the checkout load balancer?"
-         │
-         ▼
-  AskAgent.run()
-    Step 1:  parallel × 2
-               elb_health(load_balancer="checkout-alb")
-               cw_metrics("AWS/ApplicationELB", "TargetResponseTime", ...)
-    Done:    answer with target health + latency values
+  AskAgent.run()                  ← ReAct loop, up to 15 steps (standard)
+    Step 1:  aws_query("AWS::EKS::Cluster")
+    Done:    "You have 2 EKS clusters: ..."
 ```
 
 ---
@@ -330,50 +321,36 @@ Existing ./infra/*.tf
 ## Services Layer
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│  diagnoseTools.ts  (shared by AskAgent, DiagnoseAgent)              │
-│  16 tools — LLM picks dynamically at each step                      │
-│                                                                     │
-│  Core:          run_command · aws_query · aws_get · ec2_exec        │
-│  Observability: cw_metrics · cw_logs · pi_top_sql                   │
-│  Infrastructure: ecs_describe · elb_health · cloudtrail             │
-│                  asg_activity · route53_check                       │
-│  Kubernetes:    k8s_pods · k8s_events · k8s_logs                    │
-│  MCP:           mcp_tool (routes to 30+ AWS MCP server tools)       │
-│                                                                     │
-│  Safety: blocklist (rm, fdisk, dd, kubectl delete/apply/patch/scale)│
-│  Output: 6-8KB per tool result (scaled for LLM reasoning)           │
-└─────────────────────────────────────────────────────────────────────┘
+diagnoseTools.ts   shared by AskAgent + DiagnoseAgent
+  Core:          run_command · aws_query · aws_get · ec2_exec · aws_cli
+  Observability: cw_metrics · cw_logs · pi_top_sql
+  Infrastructure: ecs_describe · elb_health · cloudtrail · asg_activity · route53_check
+  Kubernetes:    k8s_pods · k8s_events · k8s_logs  (context auto-discovered)
+  MCP:           mcp_tool (routes to 30+ AWS MCP server tools)
+  Safety:        blocklist — rm, fdisk, dd, kubectl delete/apply/patch/edit/scale
 
-┌─────────────────────────────────────────────────────────────────────┐
-│  AwsMcpService  (src/services/awsMcpService.ts)                     │
-│  Multi-server MCP client — connects to awslabs MCP servers          │
-│  ├── connect()           → stdio (uvx) or HTTP transport            │
-│  ├── discoverTools()     → merges tool catalogs from all servers    │
-│  ├── callTool(name, args)→ routes to correct server automatically   │
-│  └── 30+ well-known servers with default uvx commands               │
-└─────────────────────────────────────────────────────────────────────┘
+BedrockService
+  Model:   Claude Sonnet 4.5 via Bedrock (--model to override)
+  Fallback: Mistral Large 3 if Anthropic access blocked
+  Features: retry (3×), telemetry, token tracking
 
-┌─────────────────────────────────────────────────────────────────────┐
-│  BedrockService  (src/services/bedrockService.ts)                   │
-│  LLM: Claude Sonnet 4.5 (Bedrock) — fallback: Mistral Large 3      │
-│  Region: ap-south-1 (hardcoded for Bedrock availability)            │
-│  Features: retry (3x), fallback model, telemetry, token tracking    │
-└─────────────────────────────────────────────────────────────────────┘
+AwsMcpService
+  Multi-server MCP client — stdio (uvx) or HTTP transport
+  discoverTools() merges catalogs from all connected servers
 
-┌─────────────────────────────────────────────────────────────────────┐
-│  TerraformMcpService / TerraformRegistryClient                      │
-│  ├── readExistingFiles() / writeFiles()                             │
-│  ├── materializePlan()                                              │
-│  ├── runPlan()   ─── MCP tool or exec fallback                      │
-│  └── runApply()  ─── MCP tool or exec fallback                      │
-└─────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────┐
-│  AwsExecutorService  (Cloud Control)                                │
-│  └── CreateResourceCommand → poll → SUCCESS/FAILED                  │
-└─────────────────────────────────────────────────────────────────────┘
+TerraformMcpService / TerraformRegistryClient
+  readExistingFiles / writeFiles / materializePlan / runPlan / runApply
 ```
+
+---
+
+## Reasoning Depth
+
+| Flag | `ask` steps | `diagnose` steps | Use case |
+|---|---|---|---|
+| `--reasoning quick` | 5 | 8 | Fast inventory checks, known simple issues |
+| `--reasoning standard` | 15 | 25 | Default — most incidents |
+| `--reasoning deep` | 25 | 40 | Complex multi-service failures, cert/ingress issues |
 
 ---
 
@@ -381,25 +358,22 @@ Existing ./infra/*.tf
 
 ```
 Every command:
-  │
   ├── RateLimiterService    → free:15/min · pro:60/min · enterprise:240/min
   ├── SubscriptionService   → free cannot apply · pro/enterprise can
   ├── TracingService        → all logs tagged { traceId, tenantId, command }
   └── TelemetryCollector    → model usage, token counts, latency tracking
 
-Approval gates:
+Approval gates (plan commands only):
   create  → approval before apply
-  update  → approval before write + approval before apply
-  apply   → approval before apply
+  apply   → approval before write + approval before apply
 
-ReAct tool safety (run_command blocklist):
+ReAct tool safety:
   ├── no destructive shell ops (rm -rf, fdisk, dd)
-  ├── no AWS CLI (use SDK tools instead)
-  └── no kubectl delete/apply/patch/edit/scale
+  ├── kubectl delete/apply/patch/edit/scale blocked
+  └── aws_cli: only read-only subcommands (describe, list, get, query...)
 
 Credential isolation:
-  Bedrock account (LLM calls) ← separate from → Tenant account (infrastructure)
-  Cross-account design with explicit credential passing
+  Bedrock account (LLM) ← separate from → Tenant account (infrastructure)
 ```
 
 ---
@@ -408,55 +382,39 @@ Credential isolation:
 
 ```
 src/
-├── agents/          clarifyAgent · plannerAgent · awsPlannerAgent
-│                    executorAgent · diagnoseAgent · askAgent
-├── cli/             index (commands + DI) · interactive · prompts
-├── services/        bedrockService · diagnoseTools · awsMcpService
-│                    awsExecutorService
-│                    terraformMcpService · terraformRegistryClient
-│                    tenantService · subscriptionService · rateLimiterService
-│                    tracingService · telemetryCollector · resourceTypeRegistry
-├── workflows/       infraWorkflow  (all 5 workflow methods)
-├── utils/           llm · logging · terminal
+├── agents/       clarifyAgent · plannerAgent · awsPlannerAgent
+│                 executorAgent · diagnoseAgent · askAgent
+├── cli/          index (3 commands + DI) · interactive · prompts
+├── services/     bedrockService · diagnoseTools · awsMcpService
+│                 terraformMcpService · terraformRegistryClient
+│                 tenantService · subscriptionService · rateLimiterService
+│                 tracingService · telemetryCollector · resourceTypeRegistry
+├── workflows/    infraWorkflow
+├── utils/        logging · terminal · preflight · serviceRouter · serviceCatalogs
 └── types.ts
 
-tenants/
-└── <tenantId>/plans/<planId>/   ← generated .tf files
-
 docs/
-├── architecture.md              ← this file
-└── infra-tool-roadmap.md          ← AI SRE platform roadmap
+├── architecture.md           ← this file
+└── infra-tool-roadmap.md     ← AI SRE platform roadmap
 ```
-
----
-
-## Engine Comparison
-
-| | Terraform (default) | AWS (`--engine aws`) |
-|---|---|---|
-| Plan format | HCL files | Cloud Control JSON |
-| Execution | `terraform apply` | `CreateResourceCommand` |
-| State tracking | `.tfstate` | AWS resource state |
-| Rollback | `terraform destroy` | Manual |
-| Best for | Production with drift detection | Fast provisioning |
 
 ---
 
 ## AWS SDK Dependencies
 
 ```
-@aws-sdk/client-bedrock-runtime     — LLM (Claude Sonnet 4.5)
-@aws-sdk/client-cloudcontrol         — aws_query, aws_get
-@aws-sdk/client-cloudwatch           — cw_metrics
-@aws-sdk/client-cloudwatch-logs      — cw_logs
-@aws-sdk/client-pi                   — pi_top_sql (Performance Insights)
-@aws-sdk/client-rds                  — RDS instance lookup for PI
-@aws-sdk/client-ecs                  — ecs_describe
+@aws-sdk/client-bedrock-runtime          — LLM (Claude Sonnet 4.5)
+@aws-sdk/client-cloudcontrol            — aws_query, aws_get
+@aws-sdk/client-cloudwatch              — cw_metrics
+@aws-sdk/client-cloudwatch-logs         — cw_logs
+@aws-sdk/client-pi                      — pi_top_sql (Performance Insights)
+@aws-sdk/client-rds                     — RDS instance lookup for PI
+@aws-sdk/client-ecs                     — ecs_describe
 @aws-sdk/client-elastic-load-balancing-v2 — elb_health
-@aws-sdk/client-cloudtrail           — cloudtrail
-@aws-sdk/client-auto-scaling         — asg_activity
-@aws-sdk/client-ssm                  — ec2_exec (SSM RunCommand)
-@aws-sdk/client-route-53             — route53_check
-@aws-sdk/client-sts                  — caller identity
-@modelcontextprotocol/sdk            — MCP client (stdio + HTTP)
+@aws-sdk/client-cloudtrail              — cloudtrail
+@aws-sdk/client-auto-scaling            — asg_activity
+@aws-sdk/client-ssm                     — ec2_exec (SSM RunCommand)
+@aws-sdk/client-route-53                — route53_check
+@aws-sdk/client-sts                     — preflight caller identity check
+@modelcontextprotocol/sdk               — MCP client (stdio + HTTP)
 ```

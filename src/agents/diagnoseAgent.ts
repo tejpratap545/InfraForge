@@ -57,7 +57,7 @@ type LLMResponse =
   | { done: false; thought: string; calls: ToolCall[];  tool?: never; params?: never }
   | { done: true;  thought: string; answer: string };
 
-const MAX_STEPS = 25;
+const MAX_STEPS_BY_MODE = { quick: 8, standard: 25, deep: 40 } as const;
 
 // Token budget: tool-call steps are short JSON; conclusions need room for full report.
 const STEP_MAX_TOKENS = 3072;
@@ -624,16 +624,18 @@ export class DiagnoseAgent {
       mcpService: this.mcpService,
     };
 
+    const maxSteps = MAX_STEPS_BY_MODE[options.reasoning ?? "standard"];
+
     const steps: Step[] = [];
     let finalAnswer = "";
     let stepNum = 0;
     let consecutiveErrors = 0;
 
-    while (stepNum < MAX_STEPS) {
+    while (stepNum < maxSteps) {
       stepNum++;
 
       // ── Ask LLM what to do next ────────────────────────────────────────────
-      const sp = new Spinner().start(`Step ${stepNum}/${MAX_STEPS}  ·  thinking…`);
+      const sp = new Spinner().start(`Step ${stepNum}/${maxSteps}  ·  thinking…`);
       let raw: string;
       try {
         raw = await this.bedrock.complete(

@@ -353,13 +353,13 @@ export class InfraWorkflow {
 
   // ── debug ────────────────────────────────────────────────────────────────────
 
-  async debug(serviceName: string, tenant: TenantContext, debugOptions: DebugOptions): Promise<void> {
+  async debug(serviceName: string, tenant: TenantContext, debugOptions: DebugOptions, reasoning?: "quick" | "standard" | "deep"): Promise<void> {
     const startedAt = Date.now();
     const trace = this.tracing.createTrace(tenant.tenantId, "debug");
     this.rateLimiter.assertWithinLimit(tenant, this.subscription.getLimits(tenant).commandsPerMinute);
     this.tracing.log(trace, "Debug workflow start", { serviceName, tenantId: tenant.tenantId });
 
-    const options: DebugOptions = { ...debugOptions, awsRegion: tenant.awsRegion };
+    const options: DebugOptions = { ...debugOptions, awsRegion: tenant.awsRegion, reasoning };
     const report = await this.diagnoseAgent.run(serviceName, tenant.awsRegion, options, tenant.awsCredentials);
     if (report) console.log(report);
 
@@ -368,7 +368,7 @@ export class InfraWorkflow {
 
   // ── diagnose ─────────────────────────────────────────────────────────────────
 
-  async diagnose(question: string, tenant: TenantContext, k8sContext?: string): Promise<void> {
+  async diagnose(question: string, tenant: TenantContext, k8sContext?: string, reasoning?: "quick" | "standard" | "deep"): Promise<void> {
     const startedAt = Date.now();
     const trace = this.tracing.createTrace(tenant.tenantId, "diagnose");
     this.rateLimiter.assertWithinLimit(tenant, this.subscription.getLimits(tenant).commandsPerMinute);
@@ -378,7 +378,7 @@ export class InfraWorkflow {
     printKV("Question", c.bold(question), { keyWidth: 10 });
     console.log("");
 
-    const report = await this.diagnoseAgent.run(question, tenant.awsRegion, { k8sContext }, tenant.awsCredentials);
+    const report = await this.diagnoseAgent.run(question, tenant.awsRegion, { k8sContext, reasoning }, tenant.awsCredentials);
     if (report) console.log(report);
 
     this.tracing.log(trace, "Diagnose workflow completed", { latencyMs: Date.now() - startedAt });
@@ -386,13 +386,13 @@ export class InfraWorkflow {
 
   // ── ask ──────────────────────────────────────────────────────────────────────
 
-  async ask(question: string, tenant: TenantContext, k8sContext?: string): Promise<void> {
+  async ask(question: string, tenant: TenantContext, k8sContext?: string, reasoning?: "quick" | "standard" | "deep"): Promise<void> {
     const startedAt = Date.now();
     const trace = this.tracing.createTrace(tenant.tenantId, "ask");
     this.rateLimiter.assertWithinLimit(tenant, this.subscription.getLimits(tenant).commandsPerMinute);
     this.tracing.log(trace, "Ask workflow start", { question, tenantId: tenant.tenantId });
 
-    const answer = await this.askAgent.run(question, tenant.awsRegion, k8sContext, tenant.awsCredentials);
+    const answer = await this.askAgent.run(question, tenant.awsRegion, k8sContext, tenant.awsCredentials, reasoning);
     if (answer) console.log(answer);
 
     // ── Persist Q&A to history file ──────────────────────────────────────────
