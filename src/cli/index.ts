@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import { cwd } from "node:process";
+import * as os from "node:os";
 import { ClarifyAgent } from "../agents/clarifyAgent";
 import { PlannerAgent } from "../agents/plannerAgent";
 import { AwsPlannerAgent } from "../agents/awsPlannerAgent";
@@ -22,13 +23,6 @@ import { TelemetryCollector } from "../services/telemetryCollector";
 
 const log = createLogger({ component: "cli" });
 
-function requiredEnv(name: string, fallback?: string): string {
-  const value = process.env[name] ?? fallback;
-  if (!value) {
-    throw new Error(`Missing required env var: ${name}`);
-  }
-  return value;
-}
 
 function makeWorkflow(
   region: string,
@@ -111,9 +105,13 @@ async function run(): Promise<void> {
       opts.awsAccessKeyId && opts.awsSecretAccessKey
         ? { accessKeyId: opts.awsAccessKeyId, secretAccessKey: opts.awsSecretAccessKey, sessionToken: opts.awsSessionToken }
         : undefined;
+    // TENANT_ID and USER_ID are optional — default to local machine identity
+    // so the tool works out-of-the-box without any env vars configured.
+    const tenantId = opts.tenantId ?? process.env.TENANT_ID ?? "local";
+    const userId   = opts.userId   ?? process.env.USER_ID   ?? os.userInfo().username;
     return tenantService.buildContext({
-      tenantId: requiredEnv("TENANT_ID", opts.tenantId),
-      userId: requiredEnv("USER_ID", opts.userId),
+      tenantId,
+      userId,
       subscriptionTier: opts.subscription,
       awsRegion: opts.region,
       awsCredentials,
