@@ -38,20 +38,22 @@ type LLMResponse =
   | { done: true;  thought: string; answer: string };
 
 const MAX_STEPS = 15;
+const STEP_MAX_TOKENS = 2048;
+const ANSWER_MAX_TOKENS = 4096;
 
 // ─── History compression ──────────────────────────────────────────────────────
 
 function compressHistory(steps: Step[]): string {
   if (steps.length === 0) return "(no queries yet)";
-  const recentFrom = Math.max(0, steps.length - 3);
+  const recentFrom = Math.max(0, steps.length - 5);
   return steps
     .map((s, i) => {
       if (i >= recentFrom) {
-        const result = s.result.slice(0, 400) + (s.result.length > 400 ? "\n  ...(truncated)" : "");
+        const result = s.result.slice(0, 800) + (s.result.length > 800 ? "\n  ...(truncated)" : "");
         return `[${i + 1}] ${s.tool}(${JSON.stringify(s.params)})\n  → ${s.thought}\n  Result: ${result}`;
       }
-      const keyLine = s.result.split("\n").find((l) => l.trim().length > 10) ?? s.result;
-      return `[${i + 1}] ${s.tool} → ${keyLine.slice(0, 120)}`;
+      const keyLines = s.result.split("\n").filter((l) => l.trim().length > 10).slice(0, 2);
+      return `[${i + 1}] ${s.tool} → ${keyLines.join(" | ").slice(0, 250)}`;
     })
     .join("\n\n");
 }
@@ -59,11 +61,12 @@ function compressHistory(steps: Step[]): string {
 // ─── System prompt ────────────────────────────────────────────────────────────
 
 const TOOL_NAMES =
-  "Tools: run_command(command) [kubectl/helm/network only — no aws CLI] | " +
-  "aws_query(type,region?,max_results?,filter?) | aws_get(type,identifier,region?) | " +
-  "cw_metrics(namespace,metric,dimensions?,since_hours?,period_minutes?,statistic?,region?) | " +
-  "cw_logs(log_group,filter_pattern?,since_hours?,limit?,region?)\n" +
-  "Parallel: use {\"calls\":[{\"tool\":\"...\",\"params\":{...}},{\"tool\":\"...\",\"params\":{...}}]} to run independent queries concurrently.";
+  "Tools: run_command(command) | aws_query(type,region?,name_filter?) | aws_get(type,identifier,region?) | " +
+  "cw_metrics(namespace,metric,dimensions?,since_hours?,statistic?) | cw_logs(log_group,filter_pattern?,since_hours?) | " +
+  "ecs_describe(cluster?,service?,task_id?) | elb_health(load_balancer?,target_group?) | " +
+  "cloudtrail(event_name?,resource_name?,since_hours?) | asg_activity(asg_name?) | route53_check(domain?,zone_id?) | " +
+  "k8s_pods(namespace?,selector?) | k8s_events(namespace?,severity?,since?) | k8s_logs(pod,namespace?,grep?)\n" +
+  "Parallel: {\"calls\":[{\"tool\":\"...\",\"params\":{...}},{...}]}";
 
 function systemPrompt(question: string, awsRegion: string, steps: Step[]): string {
   const history = compressHistory(steps);
@@ -84,7 +87,13 @@ RULES:
 - Use aws_query/aws_get for resource inventory questions (EC2, EKS, RDS, S3, VPC, IAM, ALB…).
 - Use cw_metrics for performance / health questions (CPU, memory, errors, latency, connections).
 - Use cw_logs for log-based questions (errors, recent events, request logs).
-- Use run_command (kubectl) for in-cluster Kubernetes questions.
+- Use ecs_describe for ECS cluster/service/task questions.
+- Use elb_health for load balancer and target health questions.
+- Use cloudtrail for "what changed?", deployment history, config change questions.
+- Use asg_activity for auto scaling group status and scaling events.
+- Use route53_check for DNS record lookups.
+- Use k8s_pods/k8s_events/k8s_logs for Kubernetes questions (prefer over raw kubectl).
+- Use run_command for network diagnostics (dig, curl, nc, traceroute).
 - Fetch in parallel when multiple independent data sources are needed.
 - Conclude as soon as you have enough to answer — don't over-query.
 - answer must be specific: include names, IDs, counts, metric values from the actual data.
@@ -121,7 +130,7 @@ export class AskAgent {
       const sp = new Spinner().start(`Step ${stepNum}/${MAX_STEPS}  ·  thinking…`);
       let raw: string;
       try {
-        raw = await this.bedrock.complete(systemPrompt(question, awsRegion, steps), { maxTokens: 1024 });
+        raw = await this.bedrock.complete(systemPrompt(question, awsRegion, steps), { maxTokens: STEP_MAX_TOKENS });
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
         sp.fail(`Step ${stepNum} — LLM error: ${errMsg}`);
@@ -192,7 +201,7 @@ export class AskAgent {
         const forcePrompt =
           systemPrompt(question, awsRegion, steps) +
           "\n\nYou have reached the step limit. Answer now with done:true using all data gathered so far.";
-        const raw2 = await this.bedrock.complete(forcePrompt, { maxTokens: 2048 });
+        const raw2 = await this.bedrock.complete(forcePrompt, { maxTokens: ANSWER_MAX_TOKENS });
         const p2 = parseJsonPayload(raw2, "ask force-answer") as LLMResponse;
         finalAnswer = p2.done
           ? (p2 as { done: true; answer: string }).answer
