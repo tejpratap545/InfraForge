@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { BedrockService } from "../services/bedrockService";
 import { ProviderSchema } from "../services/terraformRegistryClient";
-import { InfraPlan, Intent, PlanStep } from "../types";
+import { InfraAction, InfraPlan, Intent, PlanStep } from "../types";
 import { parseJsonPayload } from "../utils/llm";
 
 const PlannerOutputSchema = z.object({
@@ -48,7 +48,7 @@ export class PlannerAgent {
 
     const prompt = [
       "You are a senior Terraform engineer. You are given existing Terraform files and a change instruction.",
-      "Your task is to update the files to fulfil the instruction — change only what is necessary.",
+      "Your task is to edit existing files and/or create new files to fulfil the instruction — like a code editor, touch only what needs changing.",
       "",
       "OUTPUT: Return ONLY a valid JSON object. No markdown. No extra text.",
       "",
@@ -58,24 +58,28 @@ export class PlannerAgent {
         steps: [
           {
             description: "Human-readable step description",
-            target: "terraform resource address e.g. aws_rds_cluster.replica",
+            target: "terraform resource address e.g. aws_eks_node_group.workers",
             risk: '"low" | "medium" | "high"',
           },
         ],
         terraform: {
           files: {
-            "rds_replica.tf": "ONLY files that were added or modified — omit unchanged files entirely",
+            "existing_file.tf": "FULL updated content of an existing file you modified — must include ALL original content plus your changes",
+            "<new_resource>.tf": "FULL content of a brand-new file you are creating — name it after the resource (e.g. node_pool.tf, ec2_worker.tf, s3_backup.tf)",
           },
         },
       }, null, 2),
       "",
-      "RULES:",
-      "1. ONLY include files in terraform.files that you actually added or changed. Omit unchanged files — they will be merged automatically.",
-      "2. Never remove existing resources unless the instruction explicitly asks for deletion.",
-      "3. Preserve all existing tags, variable names, and provider configuration.",
-      "4. NEVER use empty string (\"\") or empty list ([]) for required resource attributes.",
-      "5. Follow the same naming conventions already present in the files.",
-      "6. Prefer creating a new file (e.g. rds_replica.tf) over modifying a large existing file when adding new resources.",
+      "FILE EDITING RULES (follow exactly — this is the most important section):",
+      "1. READ each existing file carefully before deciding where to make changes.",
+      "2. If the change fits naturally inside an existing file (e.g. adding a node group to cluster.tf, adding a variable to variables.tf) → EDIT that file and return its FULL updated content.",
+      "3. If the change is a self-contained new resource with no clear home → CREATE a new file named after the resource.",
+      "4. Never return a partial file. Every file in terraform.files must be complete, valid HCL.",
+      "5. Omit files you did not touch — they are merged automatically.",
+      "6. Never remove existing resources unless the instruction explicitly asks for deletion.",
+      "7. Preserve all existing tags, variable names, locals, and provider configuration.",
+      "8. NEVER use empty string (\"\") or empty list ([]) for required resource attributes.",
+      "9. Follow the naming conventions already present in the files.",
       schemaSection,
       "EXISTING FILES:",
       existingSection,
@@ -99,18 +103,25 @@ export class PlannerAgent {
   }
 
   /**
-   * Generate a Terraform plan from the user's intent.
+   * Generate a Terraform plan from a fully-enriched description string.
    *
-   * @param intent   Parsed and clarified user intent.
-   * @param schemas  Optional provider schemas fetched from the Terraform registry
-   *                 via TerraformRegistryClient. When provided, the Argument
-   *                 Reference section for each resource is injected into the
-   *                 prompt as an authoritative source — this eliminates an
-   *                 entire class of hallucinated required-field bugs (e.g.
-   *                 cidr_block = "" or subnet_ids = []).
+   * This is the agentic entry point — the description is produced by ClarifyAgent
+   * after it has interactively gathered all required parameters from the user.
+   * No Intent parsing or field extraction happens here; the LLM works purely from
+   * the natural-language description.
+   *
+   * @param description  Enriched instruction, e.g.
+   *                     "Create a t3.medium EC2 instance named web-server in ap-south-1".
+   * @param schemas      Optional provider schemas for attribute validation.
    */
-  async generatePlan(intent: Intent, schemas: ProviderSchema[] = []): Promise<InfraPlan> {
+  async generatePlanFromDescription(description: string, schemas: ProviderSchema[] = []): Promise<InfraPlan> {
     const schemaSection = this.buildSchemaSection(schemas);
+
+    // Detect action from description keywords so we can set plan.action correctly.
+    const action: InfraAction =
+      /\b(delete|remove|destroy|tear\s*down)\b/i.test(description) ? "delete" :
+      /\b(update|modify|change|resize|patch|scale)\b/i.test(description) ? "update" :
+      "create";
 
     const prompt = [
       "You are a senior Terraform engineer generating production-ready AWS infrastructure configurations.",
@@ -140,9 +151,9 @@ export class PlannerAgent {
       "1. Always start main.tf with a terraform block:",
       '   terraform { required_version = ">= 1.5"',
       '     required_providers { aws = { source = "hashicorp/aws" version = "~> 5.0" } } }',
-      '2. Always include: provider "aws" { region = var.aws_region } and variable "aws_region" { default = "<region from intent>" }',
+      '2. Always include: provider "aws" { region = var.aws_region } and variable "aws_region" { default = "<region from description>" }',
       "3. NEVER use empty string (\"\") or empty list ([]) for required resource attributes — omit optional fields instead.",
-      "4. Use descriptive, lowercase resource names separated by underscores (e.g., aws_vpc.main, aws_eks_cluster.primary).",
+      "4. Use descriptive, lowercase resource names derived from the name in the description (e.g. aws_instance.web_server).",
       '5. Tag every resource: tags = { Name = "<logical-name>", ManagedBy = "infra-copilot", Environment = "dev" }',
       "6. For VPCs: include at least 2 subnets in different AZs (use data \"aws_availability_zones\" \"available\") for HA.",
       "7. For EKS clusters: include aws_eks_cluster + aws_eks_node_group + IAM roles with these policies:",
@@ -158,22 +169,22 @@ export class PlannerAgent {
       "- medium: stateful resources (RDS, EBS volumes, ElastiCache), VPC changes, EKS node group changes",
       "- low: S3 bucket creation, CloudWatch alarms, adding tags, read-only IAM policies, Lambda updates",
       schemaSection,
-      "INTENT JSON:",
-      JSON.stringify(intent, null, 2),
+      "DESCRIPTION:",
+      description,
     ].join("\n");
 
     const raw = await this.bedrock.complete(prompt, { maxTokens: 4096 });
     const normalized = PlannerOutputSchema.parse(parseJsonPayload(raw, "Planner LLM (generate)"));
     return {
       planId: randomUUID(),
-      action: intent.action,
+      action,
       summary: normalized.summary,
       terraform: { files: this.filterFiles(normalized.terraform.files) },
       steps: this.buildSteps(normalized.steps),
       requiresApproval: true,
     };
   }
-
+ 
   private filterFiles(files: Record<string, string>): Record<string, string> {
     return Object.fromEntries(
       Object.entries(files).filter(([, content]) => content.trim().length > 0),

@@ -22,36 +22,65 @@
 
 ---
 
+## Agentic Design
+
+All agents follow the same **ReAct loop** pattern (Reason + Act):
+
+```
+while not done:
+    LLM receives:  system prompt + tool catalog + step history
+    LLM returns:   { thought, tool, params }   ← single call
+                or { thought, calls: [...] }   ← parallel fan-out
+                or { thought, done: true, answer/report/... }
+    Tool executes, result appended to history
+    History compressed (last 3 full · older summarised)
+```
+
+No cases, no pre-wired data sources, no hardcoded field extraction.
+The LLM decides at each step what to run and when it has enough information.
+
+---
+
 ## Agents
 
-| Agent | Responsibility |
-|-------|---------------|
-| `IntentAgent` | Natural language → structured `Intent` JSON |
-| `PlannerAgent` | Intent → Terraform HCL files (create) or file patches (update) |
-| `AwsPlannerAgent` | Intent → Cloud Control API call plan |
-| `ExecutorAgent` | Runs `terraform init / plan / apply` via TerraformMcpService |
-| `DebuggerAgent` | Aggregates signals from all providers → LLM root cause report |
-| `DiagnoseAgent` | Auto-discovers service → parallel signal collection → LLM triage |
-| `AskAgent` | Plans + answers AWS inventory / metrics / k8s questions |
+| Agent | Pattern | Responsibility |
+|-------|---------|---------------|
+| `ClarifyAgent` | ReAct · `ask_user` tool | Interactively gathers requirements before planning. LLM asks ONE question at a time and concludes with an enriched description + resource types. |
+| `PlannerAgent` | Single LLM call | Enriched description → Terraform HCL files (create) or file patches (update). Uses LCS unified diff for display. |
+| `AwsPlannerAgent` | Single LLM call | Enriched description → Cloud Control API call plan |
+| `ExecutorAgent` | Deterministic | Runs `terraform init / plan / apply` via TerraformMcpService |
+| `DiagnoseAgent` | ReAct · 6 tools | Single agent for both `debug` and `diagnose` commands. Accepts a question or service name + optional `DebugOptions` (Loki URL, OpenSearch URL, namespace, look-back). LLM decides the full investigation path. |
+| `AskAgent` | ReAct · 5 tools | LLM answers AWS inventory / metrics / k8s questions by querying live data. No pre-classification. |
+
+**Shared tool set** (`src/services/diagnoseTools.ts`):
+
+| Tool | What it does |
+|------|-------------|
+| `run_command(command)` | Any read-only shell cmd: `kubectl`, `helm`, `dig`, `curl` |
+| `aws_query(type, ...)` | List AWS resources via Cloud Control SDK |
+| `aws_get(type, id, ...)` | Fetch full properties of one AWS resource |
+| `ec2_exec(instance_id, cmd)` | Run command inside EC2 via SSM (no SSH needed) |
+| `cw_metrics(namespace, metric, ...)` | CloudWatch metric statistics |
+| `cw_logs(log_group, ...)` | CloudWatch Logs search |
 
 ---
 
 ## Flow: `create --engine terraform` (default)
 
 ```
-User: "create an RDS PostgreSQL instance in ap-south-1"
+User: "create an RDS PostgreSQL instance"
          │
          ▼
-  IntentAgent.parse()
-         │  Intent { action:create, resourceTypes:[aws_db_instance,...], region }
-         ▼
-  suggestClarificationQuestions()  ──► prompt user for missing params
+  ClarifyAgent.run()                        ← ReAct loop
+    LLM asks: "What instance class?"
+    LLM asks: "What is the database name?"
+    LLM concludes: enriched_instruction + resource_types
          │
          ▼
-  TerraformRegistryClient          ──► MCP server: resolveProviderDocPage
-         │  provider schemas (arg reference)
+  TerraformRegistryClient                   ← schemas for detected resource types
+         │  ProviderSchema[] (optional — registry may be unavailable)
          ▼
-  PlannerAgent.generatePlan()
+  PlannerAgent.generatePlanFromDescription()
          │  InfraPlan { summary, steps[], terraform.files{} }
          ▼
   print plan summary + risk badges
@@ -76,10 +105,10 @@ User: "create an RDS PostgreSQL instance in ap-south-1"
 User: "create an S3 bucket"
          │
          ▼
-  IntentAgent.parse()
-         │
+  ClarifyAgent.run()                        ← ReAct loop, same as above
+         │  enrichedInstruction
          ▼
-  AwsPlannerAgent.generatePlan()
+  AwsPlannerAgent.generatePlan(description)
          │  AwsExecutionPlan { calls: [{ typeName, operation, desiredState }] }
          ▼
   print Cloud Control call list
@@ -106,23 +135,32 @@ User: "create an S3 bucket"
 ## Flow: `update --tf-dir <path>` (SRE patch)
 
 ```
-Existing ./infra/rds/*.tf
+Existing ./infra/*.tf
          │
          ▼
   TerraformMcpService.readExistingFiles()   ← all .tf / .tfvars
          │
          ▼
-  detectResourceTypes()                     ← regex: resource "aws_*"
+  ClarifyAgent.run(instruction, existingFiles)  ← ReAct loop
+    LLM sees existing files as context — won't re-ask what's already defined
+    LLM asks: "What instance type for the node pool?"
+    LLM asks: "Spot or on-demand?"
+    LLM concludes: enriched_instruction + resource_types
          │
          ▼
-  TerraformRegistryClient                   ← schemas for detected types
+  TerraformRegistryClient   ← schemas for new types + existing types
          │
          ▼
-  PlannerAgent.patchExisting()
-         │  returns ONLY changed/new files
-         │  merges with existing (unchanged files kept as-is)
+  PlannerAgent.patchExisting(existingFiles, enrichedInstruction)
+    ├── Edit existing file if change fits naturally (e.g. add node_group to cluster.tf)
+    ├── Create new file if resource is self-contained (e.g. node_pool.tf)
+    └── Returns ONLY changed/new files — unchanged files merged automatically
+         │
          ▼
-  print file diff  (red = removed, green = added)
+  print unified diff per file (git-style, 3 lines of context)
+    @@ -45,7 +45,13 @@
+      capacity_type = "ON_DEMAND"
+    + tej = { instance_types = [...] }
          │
          ▼
   approved? → writeFiles() → terraform plan → approved? → terraform apply
@@ -136,17 +174,18 @@ Existing ./infra/rds/*.tf
 --service checkout-api
          │
          ▼
-  DebugAggregator.collect()  (parallel)
-    ├── CloudWatchLogsProvider    → FilterLogEvents
-    ├── CloudWatchMetricsProvider → GetMetricData
-    ├── LokiProvider              → HTTP /query_range
-    ├── OpenSearchProvider        → search API
-    └── K8sProvider               → kubectl logs + events
+  DiagnoseAgent.run(serviceName, region, options)  ← ReAct loop, up to 20 steps
+    Step 1:  run_command("kubectl get pods -n default")
+    Step 2:  parallel × 2
+               cw_logs("/ecs/checkout-api", "ERROR", since_hours=1)
+               run_command("kubectl describe pod checkout-api-xxx")
+    Step 3:  cw_metrics("AWS/ApplicationELB", "HTTPCode_Target_5XX_Count", ...)
+    ...
+    Done:    { thought, done:true, report: "## Root Cause\n..." }
          │
          ▼
-  DebuggerAgent.analyze()
-    └── BedrockService.complete() → structured RCA report:
-          Root Cause · Evidence · Mitigations · Impact
+  renderReport()  →  terminal output
+    ## Root Cause · ## Fix It Now · ## Prevent Recurrence
 ```
 
 ---
@@ -157,22 +196,17 @@ Existing ./infra/rds/*.tf
 "why is mimir crashing?"
          │
          ▼
-  DiagnoseAgent.parseQuestion()
-         │  { serviceName, problem, urgency, lookBack }
-         ▼
-  ServiceDiscovery.discover()  (parallel)
-    ├── kubectl get pods --all-namespaces
-    └── CloudWatchService.discoverLogGroups()
+  DiagnoseAgent.run()                       ← ReAct loop, up to 20 steps
+    Step 1:  run_command("kubectl get pods --all-namespaces | grep mimir")
+    Step 2:  parallel × 2
+               run_command("kubectl describe pod mimir-xxx -n monitoring")
+               cw_logs("/aws/eks/cluster", "mimir", since_hours=1)
+    Step 3:  aws_query("AWS::EKS::Cluster") → check node group status
+    ...
+    Done:    { thought, done:true, answer: "## Root Cause\n..." }
          │
          ▼
-  parallel signal collection:
-    ├── DebugAggregator.collect()     (all debug providers)
-    ├── K8sInventoryService.query()   (pods, events, deployments)
-    └── AwsMetricsService.query()     (problem-specific metrics)
-         │
-         ▼
-  DiagnoseAgent LLM prompt → structured report:
-    ## Direct Answer  /  ## Root Cause  /  ## Fix Now  /  ## Fix Properly  /  ## Impact
+  renderReport()
 ```
 
 ---
@@ -183,16 +217,22 @@ Existing ./infra/rds/*.tf
 "how many EKS clusters in ap-south-1?"
          │
          ▼
-  AskAgent.plan()
-         │  AskPlan { targets:["eks"], questionType:"count", region }
-         ▼
-  parallel data collection:
-    ├── AwsInventoryService.collect()   (Cloud Control + STS)
-    ├── AwsMetricsService.query()       (if metricsQuery present)
-    └── K8sInventoryService.query()     (if k8sQuery present)
+  AskAgent.run()                            ← ReAct loop, up to 15 steps
+    Step 1:  aws_query("AWS::EKS::Cluster", region="ap-south-1")
+    Done:    { thought, done:true, answer: "You have 2 EKS clusters: ..." }
          │
          ▼
-  AskAgent.answer()  →  BedrockService  →  plain-English answer
+  renderReport()
+
+"what is the CPU usage of my lambda functions?"
+         │
+         ▼
+  AskAgent.run()
+    Step 1:  parallel × 3
+               cw_metrics("AWS/Lambda", "Duration", ...)
+               cw_metrics("AWS/Lambda", "Errors", ...)
+               cw_metrics("AWS/Lambda", "Throttles", ...)
+    Done:    answer with actual metric values
 ```
 
 ---
@@ -201,28 +241,26 @@ Existing ./infra/rds/*.tf
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  CloudWatchService  (unified gateway)                   │
-│  ├── queryMetrics()  →  GetMetricData (single batch)    │
-│  ├── queryLogs()     →  FilterLogEvents                 │
-│  └── discoverLogGroups()                                │
-│       ▲                ▲                                │
-│  AwsMetricsService  CloudWatchLogsProvider              │
-│  CloudWatchMetricsProvider   ServiceDiscovery           │
+│  diagnoseTools.ts  (shared by AskAgent, DiagnoseAgent)  │
+│  ├── run_command()   shell execution (kubectl/helm/dig) │
+│  ├── aws_query()     Cloud Control ListResources        │
+│  ├── aws_get()       Cloud Control GetResource          │
+│  ├── ec2_exec()      SSM RunCommand on EC2              │
+│  ├── cw_metrics()    CloudWatch GetMetricStatistics     │
+│  └── cw_logs()       CloudWatch FilterLogEvents         │
 └─────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────┐
 │  TerraformMcpService                                    │
 │  ├── readExistingFiles() / writeFiles()                 │
 │  ├── materializePlan()                                  │
-│  ├── runPlan()   ─── MCP tool "terraform_plan"          │
-│  │                └─ exec fallback                      │
-│  └── runApply()  ─── MCP tool "terraform_apply"         │
-│                  └─ exec fallback                       │
+│  ├── runPlan()   ─── MCP tool or exec fallback          │
+│  └── runApply()  ─── MCP tool or exec fallback          │
 └─────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────┐
 │  TerraformRegistryClient  (MCP client)                  │
-│  └── resolveProviderDocPage → schema injection          │
+│  └── fetchSchemas() → schema injection into planner     │
 │  Transport: stdio (terraform-mcp-server binary)         │
 │         or  HTTP  (TERRAFORM_MCP_URL=...)               │
 └─────────────────────────────────────────────────────────┘
@@ -248,6 +286,11 @@ Approval gates:
   create  → approval before apply
   update  → approval before write + approval before apply
   apply   → approval before apply
+
+ReAct tool safety (run_command blocklist):
+  ├── no destructive shell ops (rm -rf, fdisk, dd)
+  ├── no AWS CLI (use SDK tools instead)
+  └── no kubectl delete/apply
 ```
 
 ---
@@ -256,17 +299,14 @@ Approval gates:
 
 ```
 src/
-├── agents/          intentAgent · plannerAgent · awsPlannerAgent
-│                    executorAgent · debuggerAgent · diagnoseAgent · askAgent
+├── agents/          clarifyAgent · plannerAgent · awsPlannerAgent
+│                    executorAgent · diagnoseAgent · askAgent
 ├── cli/             index (commands + DI) · interactive · prompts
-├── services/        bedrockService · cloudWatchService · awsMetricsService
-│                    awsExecutorService · awsInventoryService · k8sInventoryService
+├── services/        bedrockService · diagnoseTools
+│                    awsExecutorService
 │                    terraformMcpService · terraformRegistryClient
 │                    tenantService · subscriptionService · rateLimiterService
-│                    serviceDiscovery · tracingService
-├── providers/       IDebugProvider · debugAggregator
-│                    cloudWatchLogsProvider · cloudWatchMetricsProvider
-│                    lokiProvider · openSearchProvider · k8sProvider
+│                    tracingService · telemetryCollector
 ├── workflows/       infraWorkflow  (all 5 workflow methods)
 ├── utils/           llm · logging · terminal
 └── types.ts

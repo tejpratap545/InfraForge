@@ -1,21 +1,17 @@
-import { IntentAgent } from "../agents/intentAgent";
+import { ClarifyAgent } from "../agents/clarifyAgent";
 import { PlannerAgent } from "../agents/plannerAgent";
 import { AwsPlannerAgent } from "../agents/awsPlannerAgent";
 import { ExecutorAgent } from "../agents/executorAgent";
-import { DebuggerAgent } from "../agents/debuggerAgent";
 import { DiagnoseAgent } from "../agents/diagnoseAgent";
 import { AskAgent } from "../agents/askAgent";
-import { collectMissingIntentFields, askForApproval } from "../cli/prompts";
-import { AwsInventoryService } from "../services/awsInventoryService";
-import { AwsMetricsService } from "../services/awsMetricsService";
+import { askForApproval } from "../cli/prompts";
 import { AwsExecutorService } from "../services/awsExecutorService";
-import { K8sInventoryService } from "../services/k8sInventoryService";
 import { RateLimiterService } from "../services/rateLimiterService";
 import { SubscriptionService } from "../services/subscriptionService";
 import { TerraformRegistryClient, ProviderSchema } from "../services/terraformRegistryClient";
 import { TerraformMcpService } from "../services/terraformMcpService";
 import { TracingService } from "../services/tracingService";
-import { InfraPlan, Intent, PlanStep, TenantContext, DebugOptions } from "../types";
+import { InfraPlan, PlanStep, TenantContext, DebugOptions } from "../types";
 import {
   c,
   sym,
@@ -23,10 +19,85 @@ import {
   printBoxHeader,
   printKV,
   printRule,
-  renderReport,
   printOutputBlock,
   elapsed,
 } from "../utils/terminal";
+
+// ─── Unified diff helpers ─────────────────────────────────────────────────────
+
+type EditOp = { type: "keep" | "delete" | "insert"; line: string };
+
+/**
+ * LCS-based line diff. Returns an ordered list of keep/delete/insert operations.
+ * Capped at 500k cell matrix to avoid O(m*n) blowup on very large files.
+ */
+function computeDiff(prev: string[], next: string[]): EditOp[] {
+  const m = prev.length, n = next.length;
+
+  if (m * n > 500_000) {
+    // Fallback for huge files — show as full replace
+    return [
+      ...prev.map((line) => ({ type: "delete" as const, line })),
+      ...next.map((line) => ({ type: "insert" as const, line })),
+    ];
+  }
+
+  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      dp[i][j] = prev[i - 1] === next[j - 1]
+        ? dp[i - 1][j - 1] + 1
+        : Math.max(dp[i - 1][j], dp[i][j - 1]);
+    }
+  }
+
+  const ops: EditOp[] = [];
+  let i = m, j = n;
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && prev[i - 1] === next[j - 1]) {
+      ops.unshift({ type: "keep", line: prev[i - 1] });
+      i--; j--;
+    } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+      ops.unshift({ type: "insert", line: next[j - 1] });
+      j--;
+    } else {
+      ops.unshift({ type: "delete", line: prev[i - 1] });
+      i--;
+    }
+  }
+  return ops;
+}
+
+interface Hunk { oldStart: number; oldCount: number; newStart: number; newCount: number; lines: EditOp[] }
+
+/** Group diff ops into hunks, each padded with `ctx` context lines. */
+function buildHunks(ops: EditOp[], ctx: number): Hunk[] {
+  const changed = ops.map((op, i) => (op.type !== "keep" ? i : -1)).filter((i) => i >= 0);
+  if (changed.length === 0) return [];
+
+  // Merge overlapping/adjacent context windows into ranges
+  const ranges: Array<{ from: number; to: number }> = [];
+  let from = Math.max(0, changed[0] - ctx);
+  let to   = Math.min(ops.length - 1, changed[0] + ctx);
+  for (let ci = 1; ci < changed.length; ci++) {
+    const nf = Math.max(0, changed[ci] - ctx);
+    const nt = Math.min(ops.length - 1, changed[ci] + ctx);
+    if (nf <= to + 1) { to = nt; } else { ranges.push({ from, to }); from = nf; to = nt; }
+  }
+  ranges.push({ from, to });
+
+  return ranges.map(({ from, to }) => {
+    let oldStart = 1, newStart = 1;
+    for (let k = 0; k < from; k++) {
+      if (ops[k].type !== "insert") oldStart++;
+      if (ops[k].type !== "delete") newStart++;
+    }
+    const lines = ops.slice(from, to + 1);
+    const oldCount = lines.filter((o) => o.type !== "insert").length;
+    const newCount = lines.filter((o) => o.type !== "delete").length;
+    return { oldStart, oldCount, newStart, newCount, lines };
+  });
+}
 
 // ─── Risk badge ───────────────────────────────────────────────────────────────
 
@@ -42,16 +113,12 @@ function riskBadge(risk: PlanStep["risk"]): string {
 
 export class InfraWorkflow {
   constructor(
-    private readonly intentAgent: IntentAgent,
+    private readonly clarifyAgent: ClarifyAgent,
     private readonly plannerAgent: PlannerAgent,
     private readonly awsPlannerAgent: AwsPlannerAgent,
     private readonly executorAgent: ExecutorAgent,
-    private readonly debuggerAgent: DebuggerAgent,
     private readonly diagnoseAgent: DiagnoseAgent,
     private readonly askAgent: AskAgent,
-    private readonly awsInventory: AwsInventoryService,
-    private readonly awsMetrics: AwsMetricsService,
-    private readonly k8sInventory: K8sInventoryService,
     private readonly registryClient: TerraformRegistryClient,
     private readonly terraformMcp: TerraformMcpService,
     private readonly rateLimiter: RateLimiterService,
@@ -68,7 +135,7 @@ export class InfraWorkflow {
     this.rateLimiter.assertWithinLimit(tenant, this.subscription.getLimits(tenant).commandsPerMinute);
     console.log("");
 
-    const { plan } = await this.parseIntentAndPlan(rawInput, trace);
+    const { plan } = await this.clarifyAndPlan(rawInput, trace);
 
     const approved = await askForApproval("Apply this plan to your AWS account?");
     if (!approved) {
@@ -96,7 +163,7 @@ export class InfraWorkflow {
     this.rateLimiter.assertWithinLimit(tenant, this.subscription.getLimits(tenant).commandsPerMinute);
     console.log("");
 
-    const { plan } = await this.parseIntentAndPlan(rawInput, trace);
+    const { plan } = await this.clarifyAndPlan(rawInput, trace);
 
     const sp = new Spinner().start("Running terraform plan (dry run)");
     const output = await this.executorAgent.dryRun(tenant.tenantId, plan);
@@ -116,7 +183,7 @@ export class InfraWorkflow {
     this.subscription.assertCanApply(tenant);
     console.log("");
 
-    const { plan } = await this.parseIntentAndPlan(rawInput, trace);
+    const { plan } = await this.clarifyAndPlan(rawInput, trace);
 
     const approved = await askForApproval("Apply this plan to your AWS account?");
     if (!approved) {
@@ -146,28 +213,18 @@ export class InfraWorkflow {
     this.rateLimiter.assertWithinLimit(tenant, this.subscription.getLimits(tenant).commandsPerMinute);
     console.log("");
 
-    // Step 1 — parse intent
-    const sp1 = new Spinner().start("Parsing intent");
-    let intent = await this.intentAgent.parse(rawInput);
-    const questions = await this.intentAgent.suggestClarificationQuestions(intent);
-    sp1.succeed(
-      `Intent parsed  ${c.dim("→")}  ${intent.resourceTypes.join(", ")}` +
-        (intent.region ? `  ${c.dim("·")}  ${c.cyan(intent.region)}` : ""),
-    );
-    if (questions.length > 0) {
-      console.log("");
-      intent = await collectMissingIntentFields(intent, questions);
-    }
+    // Step 1 — agentic clarification loop
+    const { enrichedInstruction } = await this.clarifyAgent.run(rawInput);
+    this.tracing.debug(trace, "Requirements gathered", { enrichedInstruction });
 
-    // Step 2 — generate AWS SDK call plan
+    // Step 2 — generate AWS Cloud Control call plan
     const sp2 = new Spinner().start("Generating AWS API call plan");
-    const plan = await this.awsPlannerAgent.generatePlan(intent);
+    const plan = await this.awsPlannerAgent.generatePlan(enrichedInstruction, tenant.awsRegion);
     sp2.succeed(`Plan ready  ${c.dim("·")}  ${c.bold(String(plan.calls.length))} API calls  ${c.dim(plan.planId)}`);
     this.tracing.debug(trace, "AWS plan generated", { planId: plan.planId, calls: plan.calls.length });
     console.log("");
     this.printPlanSummary({ ...plan, action: "create", terraform: { files: {} } });
 
-    // Print call list
     console.log(`  ${c.bold("Cloud Control Calls")}\n`);
     plan.calls.forEach((call, i) => {
       console.log(`    ${c.dim(String(i + 1) + ".")} ${c.cyan(call.typeName)}  ${c.bold(call.operation.toUpperCase())}  ${c.dim("—")}  ${call.description}`);
@@ -184,15 +241,17 @@ export class InfraWorkflow {
 
     // Step 3 — execute calls sequentially
     console.log("");
-    const executor = new AwsExecutorService(intent.region ?? tenant.awsRegion);
+    const executor = new AwsExecutorService(tenant.awsRegion);
     let failCount = 0;
     for (const call of plan.calls) {
       const sp = new Spinner().start(`${c.cyan(call.typeName)}  ${c.bold(call.operation.toUpperCase())}`);
       const [result] = await executor.execute([call]);
       if (result.success) {
-        sp.succeed(`${c.cyan(call.typeName)}  ${c.bold(call.operation.toUpperCase())}` +
+        sp.succeed(
+          `${c.cyan(call.typeName)}  ${c.bold(call.operation.toUpperCase())}` +
           (result.identifier ? `  ${c.dim("id:")} ${c.dim(result.identifier)}` : "") +
-          `  ${c.dim("—")}  ${c.dim(call.description)}`);
+          `  ${c.dim("—")}  ${c.dim(call.description)}`,
+        );
       } else {
         sp.fail(`${c.cyan(call.typeName)}  ${c.red("FAILED")}  ${c.dim(result.error ?? "")}`);
         failCount++;
@@ -209,8 +268,8 @@ export class InfraWorkflow {
   // ── update (SRE patch flow) ──────────────────────────────────────────────────
 
   /**
-   * SRE update flow: read an existing Terraform directory, patch it with LLM,
-   * show a file diff for approval, then run terraform plan → apply.
+   * SRE update flow: agentic clarification → read existing TF files → patch →
+   * show diff → terraform plan → apply.
    *
    * @param instruction  Plain-language change description.
    * @param tfDir        Absolute path to the existing Terraform directory.
@@ -222,31 +281,36 @@ export class InfraWorkflow {
     this.rateLimiter.assertWithinLimit(tenant, this.subscription.getLimits(tenant).commandsPerMinute);
     console.log("");
 
-    // Step 1 — read existing files
+    // Step 1 — read existing files first so ClarifyAgent can reference them
     const sp1 = new Spinner().start(`Reading Terraform files from ${c.cyan(tfDir)}`);
     const existingFiles = await this.terraformMcp.readExistingFiles(tfDir);
     sp1.succeed(`Read ${c.bold(String(Object.keys(existingFiles).length))} files  ${c.dim(Object.keys(existingFiles).join(", "))}`);
     this.tracing.debug(trace, "Existing files read", { tfDir, files: Object.keys(existingFiles) });
 
-    // Step 2 — fetch schemas based on resource types already in the files
-    const detectedTypes = this.detectResourceTypes(existingFiles);
-    const sp2 = new Spinner().start("Fetching provider schemas");
-    const schemas = await this.fetchSchemas(trace, { resourceTypes: detectedTypes, action: "patch", rawInput: instruction });
-    sp2.succeed(
+    // Step 2 — agentic clarification loop (existing files give the LLM context)
+    const { enrichedInstruction, resourceTypes: newTypes } = await this.clarifyAgent.run(instruction, existingFiles);
+    this.tracing.debug(trace, "Requirements gathered", { enrichedInstruction });
+
+    // Step 3 — fetch schemas for both new and existing resource types
+    const existingTypes = this.detectResourceTypes(existingFiles);
+    const allTypes = [...new Set([...newTypes, ...existingTypes])];
+    const sp3 = new Spinner().start("Fetching provider schemas");
+    const schemas = await this.fetchSchemas(trace, allTypes);
+    sp3.succeed(
       schemas.length > 0
         ? `Schemas  ${c.dim(schemas.map((s) => s.resourceType).join(", "))}`
         : `Schemas  ${c.dim("registry unavailable — proceeding without")}`,
     );
 
-    // Step 3 — LLM patches the files
-    const sp3 = new Spinner().start("Generating file patches");
-    const plan = await this.plannerAgent.patchExisting(existingFiles, instruction, schemas);
-    sp3.succeed(`Patches ready  ${c.dim("·")}  ${c.bold(String(plan.steps.length))} steps  ${c.dim(plan.planId)}`);
+    // Step 4 — LLM patches the files
+    const sp4 = new Spinner().start("Generating file patches");
+    const plan = await this.plannerAgent.patchExisting(existingFiles, enrichedInstruction, schemas);
+    sp4.succeed(`Patches ready  ${c.dim("·")}  ${c.bold(String(plan.steps.length))} steps  ${c.dim(plan.planId)}`);
     this.tracing.debug(trace, "Patch plan generated", { planId: plan.planId });
     console.log("");
     this.printPlanSummary(plan);
 
-    // Step 4 — show diff per file
+    // Step 5 — show diff per file
     this.printFileDiff(existingFiles, plan.terraform.files);
 
     const approved = await askForApproval("Write these changes and run terraform plan?");
@@ -257,16 +321,16 @@ export class InfraWorkflow {
     }
     this.subscription.assertCanApply(tenant);
 
-    // Step 5 — write patched files back to the same directory
-    const sp5 = new Spinner().start("Writing updated files");
+    // Step 6 — write patched files back to disk
+    const sp6 = new Spinner().start("Writing updated files");
     await this.terraformMcp.writeFiles(tfDir, plan.terraform.files);
-    sp5.succeed(`Files written to ${c.cyan(tfDir)}`);
+    sp6.succeed(`Files written to ${c.cyan(tfDir)}`);
 
-    // Step 6 — terraform plan (in-place — files already on disk)
+    // Step 7 — terraform plan
     console.log("");
-    const sp6 = new Spinner().start("Running terraform plan");
+    const sp7 = new Spinner().start("Running terraform plan");
     const tfPlanOut = await this.terraformMcp.runPlan(tfDir);
-    sp6.succeed(`Terraform plan complete  ${c.dim("·")}  ${c.dim(elapsed(startedAt))}`);
+    sp7.succeed(`Terraform plan complete  ${c.dim("·")}  ${c.dim(elapsed(startedAt))}`);
     printOutputBlock("terraform plan", tfPlanOut);
 
     const applyApproved = await askForApproval("Apply these changes to your AWS account?");
@@ -276,10 +340,10 @@ export class InfraWorkflow {
       return;
     }
 
-    // Step 7 — terraform apply
-    const sp7 = new Spinner().start("Applying changes");
+    // Step 8 — terraform apply
+    const sp8 = new Spinner().start("Applying changes");
     const tfApplyOut = await this.terraformMcp.runApply(tfDir);
-    sp7.succeed(`Applied  ${c.dim("·")}  ${c.dim(elapsed(startedAt))}`);
+    sp8.succeed(`Applied  ${c.dim("·")}  ${c.dim(elapsed(startedAt))}`);
     printOutputBlock("terraform apply", tfApplyOut);
     this.tracing.log(trace, "Update workflow completed", { latencyMs: Date.now() - startedAt, planId: plan.planId });
   }
@@ -290,25 +354,13 @@ export class InfraWorkflow {
     const startedAt = Date.now();
     const trace = this.tracing.createTrace(tenant.tenantId, "debug");
     this.rateLimiter.assertWithinLimit(tenant, this.subscription.getLimits(tenant).commandsPerMinute);
+    this.tracing.log(trace, "Debug workflow start", { serviceName, tenantId: tenant.tenantId });
+
     const options: DebugOptions = { ...debugOptions, awsRegion: tenant.awsRegion };
-    console.log("");
+    const report = await this.diagnoseAgent.run(serviceName, tenant.awsRegion, options);
+    if (report) console.log(report);
 
-    const sp1 = new Spinner().start(`Collecting signals for ${c.bold(serviceName)}`);
-    this.tracing.log(trace, "Fetching debug signals", { serviceName });
-
-    const sp2 = new Spinner().start("Analyzing with LLM");
-    const report = await this.debuggerAgent.analyze(serviceName, options)
-      .finally(() => sp2.succeed(`Analysis complete  ${c.dim("·")}  ${c.dim(elapsed(startedAt))}`));
-
-    sp1.succeed(`Signals collected  ${c.dim("·")}  ${c.dim(options.since ?? "1h")} look-back`);
-
-    console.log("");
-    printBoxHeader(`Debug Report  ·  ${serviceName}`);
-    printKV("Service",   c.bold(serviceName),         { keyWidth: 10 });
-    printKV("Look-back", c.cyan(options.since ?? "1h"), { keyWidth: 10 });
-    console.log("");
-    console.log(renderReport(report));
-    this.tracing.log(trace, "Workflow completed", { latencyMs: Date.now() - startedAt, serviceName });
+    this.tracing.log(trace, "Debug workflow completed", { latencyMs: Date.now() - startedAt, serviceName });
   }
 
   // ── diagnose ─────────────────────────────────────────────────────────────────
@@ -323,7 +375,7 @@ export class InfraWorkflow {
     printKV("Question", c.bold(question), { keyWidth: 10 });
     console.log("");
 
-    const report = await this.diagnoseAgent.run(question, tenant.awsRegion, k8sContext);
+    const report = await this.diagnoseAgent.run(question, tenant.awsRegion, { k8sContext });
     if (report) console.log(report);
 
     this.tracing.log(trace, "Diagnose workflow completed", { latencyMs: Date.now() - startedAt });
@@ -335,98 +387,29 @@ export class InfraWorkflow {
     const startedAt = Date.now();
     const trace = this.tracing.createTrace(tenant.tenantId, "ask");
     this.rateLimiter.assertWithinLimit(tenant, this.subscription.getLimits(tenant).commandsPerMinute);
-    console.log("");
+    this.tracing.log(trace, "Ask workflow start", { question, tenantId: tenant.tenantId });
 
-    const sp1 = new Spinner().start("Understanding your AWS question");
-    const plan = await this.askAgent.plan(question);
-    if (plan.questionType === "unknown") {
-      sp1.fail("Could not map question to AWS inventory");
-      throw new Error(
-        plan.unsupportedReason ??
-          "Ask mode could not map that question to the current live AWS inventory capabilities.",
-      );
-    }
-    const resolvedRegion = plan.region?.trim() || tenant.awsRegion;
-    sp1.succeed(
-      `Understood  ${c.dim(sym.arrow)}  targets: ${c.cyan(plan.targets.join(", "))}  ${c.dim("·")}  ${c.dim(plan.questionType)}  ${c.dim("·")}  ${c.cyan(resolvedRegion)}`,
-    );
-    this.tracing.log(trace, "Ask plan generated", { question, targets: plan.targets, region: resolvedRegion });
+    const answer = await this.askAgent.run(question, tenant.awsRegion);
+    if (answer) console.log(answer);
 
-    // Collect all three data tracks in parallel
-    const hasInventory = plan.targets.length > 0;
-    const hasMetrics   = !!plan.metricsQuery;
-    const hasK8s       = !!plan.k8sQuery;
-
-    const sp2Label = hasK8s
-      ? `Querying Kubernetes  ${c.dim("·")}  ${this.askAgent.describeK8sQuery(plan.k8sQuery!)}`
-      : hasMetrics && !hasInventory
-        ? `Querying CloudWatch  ${c.dim("·")}  ${this.askAgent.describeMetricsQuery(plan.metricsQuery!)}`
-        : "Collecting live data";
-    const sp2 = new Spinner().start(sp2Label);
-
-    const emptySnapshot = { accountId: undefined, accountArn: undefined, region: resolvedRegion, generatedAt: new Date().toISOString(), services: {} };
-
-    const [snapshot, metricsText, k8sText] = await Promise.all([
-      hasInventory
-        ? this.awsInventory.collect(plan.targets, resolvedRegion)
-        : Promise.resolve(emptySnapshot),
-      hasMetrics
-        ? this.awsMetrics.query(plan.metricsQuery!, resolvedRegion)
-        : Promise.resolve(undefined),
-      hasK8s
-        ? this.k8sInventory.query(plan.k8sQuery!, resolvedRegion)
-        : Promise.resolve(undefined),
-    ]);
-
-    const succeeded = Object.values(snapshot.services).filter((s) => s && !s.error).length;
-    if (hasInventory && succeeded === 0 && !hasMetrics && !hasK8s) {
-      sp2.fail("Could not collect AWS inventory");
-      throw new Error("Could not collect AWS inventory. Check AWS credentials, region, and IAM permissions.");
-    }
-    const total = Object.values(snapshot.services).reduce((n, s) => n + (s?.count ?? 0), 0);
-    const parts = [
-      hasInventory ? `${c.bold(String(succeeded))} services  ${c.dim("·")}  ${c.bold(String(total))} resources` : "",
-      hasMetrics   ? c.dim("CloudWatch") : "",
-      hasK8s       ? c.dim("Kubernetes") : "",
-    ].filter(Boolean).join(`  ${c.dim("·")}  `);
-    sp2.succeed(`Data ready  ${c.dim("·")}  ${parts}`);
-    this.tracing.log(trace, "Data collected", { targets: plan.targets, succeeded, hasMetrics, hasK8s });
-
-    const sp3 = new Spinner().start("Answering with live data");
-    const answer = await this.askAgent.answer(question, snapshot, metricsText ?? undefined, k8sText ?? undefined);
-    sp3.succeed(`Done  ${c.dim("·")}  ${c.dim(elapsed(startedAt))}`);
-
-    console.log("");
-    printBoxHeader("AWS Inventory Answer");
-    printKV("Question", c.bold(question), { keyWidth: 10 });
-    printKV("Region",   c.cyan(resolvedRegion), { keyWidth: 10 });
-    console.log("");
-    console.log(renderReport(answer));
-    this.tracing.log(trace, "Workflow completed", { latencyMs: Date.now() - startedAt, question });
+    this.tracing.log(trace, "Ask workflow completed", { latencyMs: Date.now() - startedAt, question });
   }
 
   // ── helpers ──────────────────────────────────────────────────────────────────
 
-  /** Shared parse → clarify → schemas → plan pipeline for Terraform workflows. */
-  private async parseIntentAndPlan(
+  /**
+   * Shared clarify → schemas → plan pipeline for Terraform create/plan/apply workflows.
+   * ClarifyAgent drives the conversation; planner generates HCL from the enriched description.
+   */
+  private async clarifyAndPlan(
     rawInput: string,
     trace: ReturnType<TracingService["createTrace"]>,
-  ): Promise<{ intent: Intent; plan: InfraPlan }> {
-    const sp1 = new Spinner().start("Parsing intent");
-    let intent = await this.intentAgent.parse(rawInput);
-    const questions = await this.intentAgent.suggestClarificationQuestions(intent);
-    sp1.succeed(
-      `Intent parsed  ${c.dim(sym.arrow)}  ${intent.resourceTypes.join(", ")}` +
-        (intent.region ? `  ${c.dim("·")}  ${c.cyan(intent.region)}` : ""),
-    );
-    if (questions.length > 0) {
-      console.log("");
-      intent = await collectMissingIntentFields(intent, questions);
-    }
-    this.tracing.debug(trace, "Intent parsed", { intent });
+  ): Promise<{ plan: InfraPlan }> {
+    const { enrichedInstruction, resourceTypes } = await this.clarifyAgent.run(rawInput);
+    this.tracing.debug(trace, "Requirements gathered", { enrichedInstruction, resourceTypes });
 
     const sp2 = new Spinner().start("Fetching Terraform provider schemas");
-    const schemas = await this.fetchSchemas(trace, intent);
+    const schemas = await this.fetchSchemas(trace, resourceTypes);
     sp2.succeed(
       schemas.length > 0
         ? `Schemas  ${c.dim(schemas.map((s) => s.resourceType).join(", "))}`
@@ -434,13 +417,13 @@ export class InfraWorkflow {
     );
 
     const sp3 = new Spinner().start("Generating infrastructure plan");
-    const plan = await this.plannerAgent.generatePlan(intent, schemas);
+    const plan = await this.plannerAgent.generatePlanFromDescription(enrichedInstruction, schemas);
     sp3.succeed(`Plan ready  ${c.dim("·")}  ${c.bold(String(plan.steps.length))} steps  ${c.dim(plan.planId)}`);
     this.tracing.debug(trace, "Plan generated", { planId: plan.planId, steps: plan.steps.length });
     console.log("");
     this.printPlanSummary(plan);
 
-    return { intent, plan };
+    return { plan };
   }
 
   /** Extract `aws_*` resource type strings from raw HCL file contents. */
@@ -450,36 +433,56 @@ export class InfraWorkflow {
     return [...new Set(matches)];
   }
 
-  /** Print a simple before/after diff for each file that changed. */
+  /** Print a unified diff (git-style) for every file that changed. */
   private printFileDiff(before: Record<string, string>, after: Record<string, string>): void {
     const allFiles = new Set([...Object.keys(before), ...Object.keys(after)]);
     let anyDiff = false;
+
     for (const name of allFiles) {
       const prev = before[name] ?? "";
       const next = after[name] ?? "";
       if (prev === next) continue;
       anyDiff = true;
-      console.log(`\n  ${c.bold(c.cyan(name))}`);
-      const prevLines = prev.split("\n");
-      const nextLines = next.split("\n");
-      // Print removed lines (in before but not after)
-      for (const line of prevLines) {
-        if (!nextLines.includes(line)) console.log(`    ${c.red("- " + line)}`);
+
+      const prevLines = prev === "" ? [] : prev.split("\n");
+      const nextLines = next === "" ? [] : next.split("\n");
+
+      if (!before[name]) {
+        // Brand-new file — show everything as added
+        console.log(`\n  ${c.bold(c.green("+ " + name))}  ${c.dim(`(new file · ${nextLines.length} lines)`)}`);
+        for (const line of nextLines) console.log(`    ${c.green("+" + line)}`);
+        continue;
       }
-      // Print added lines (in after but not before)
-      for (const line of nextLines) {
-        if (!prevLines.includes(line)) console.log(`    ${c.green("+ " + line)}`);
+
+      if (!after[name]) {
+        console.log(`\n  ${c.bold(c.red("- " + name))}  ${c.dim("(deleted)")}`);
+        continue;
+      }
+
+      // Modified file — unified diff with 3 lines of context
+      console.log(`\n  ${c.bold(c.cyan(name))}`);
+      const hunks = buildHunks(computeDiff(prevLines, nextLines), 3);
+      for (const hunk of hunks) {
+        console.log(
+          `  ${c.dim(`@@ -${hunk.oldStart},${hunk.oldCount} +${hunk.newStart},${hunk.newCount} @@`)}`,
+        );
+        for (const op of hunk.lines) {
+          if (op.type === "keep")   console.log(`    ${c.dim(" " + op.line)}`);
+          if (op.type === "delete") console.log(`    ${c.red("-" + op.line)}`);
+          if (op.type === "insert") console.log(`    ${c.green("+" + op.line)}`);
+        }
       }
     }
+
     if (!anyDiff) console.log(`  ${c.dim("No file changes detected.")}`);
     console.log("");
   }
 
   private async fetchSchemas(
     trace: ReturnType<TracingService["createTrace"]>,
-    intent: Intent,
+    resourceTypes: string[],
   ): Promise<ProviderSchema[]> {
-    if (intent.resourceTypes.length === 0) return [];
+    if (resourceTypes.length === 0) return [];
 
     const connected = await this.registryClient.connect();
     if (!connected) {
@@ -490,10 +493,10 @@ export class InfraWorkflow {
     }
 
     try {
-      const schemas = await this.registryClient.fetchSchemas("aws", intent.resourceTypes);
+      const schemas = await this.registryClient.fetchSchemas("aws", resourceTypes);
       this.tracing.log(trace, "Provider schemas fetched", {
         transport: this.registryClient.transport,
-        requested: intent.resourceTypes.length,
+        requested: resourceTypes.length,
         resolved: schemas.length,
       });
       return schemas;

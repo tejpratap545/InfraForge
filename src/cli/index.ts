@@ -1,17 +1,12 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import { cwd } from "node:process";
-import { IntentAgent } from "../agents/intentAgent";
+import { ClarifyAgent } from "../agents/clarifyAgent";
 import { PlannerAgent } from "../agents/plannerAgent";
 import { AwsPlannerAgent } from "../agents/awsPlannerAgent";
 import { ExecutorAgent } from "../agents/executorAgent";
-import { DebuggerAgent } from "../agents/debuggerAgent";
 import { DiagnoseAgent } from "../agents/diagnoseAgent";
 import { AskAgent } from "../agents/askAgent";
-import { DebugAggregator } from "../providers/debugAggregator";
-import { AwsInventoryService } from "../services/awsInventoryService";
-import { AwsMetricsService } from "../services/awsMetricsService";
-import { K8sInventoryService } from "../services/k8sInventoryService";
 import { BedrockService } from "../services/bedrockService";
 import { TerraformMcpService } from "../services/terraformMcpService";
 import { TerraformRegistryClient } from "../services/terraformRegistryClient";
@@ -36,30 +31,21 @@ function requiredEnv(name: string, fallback?: string): string {
 
 function makeWorkflow(region: string, modelId?: string, telemetry?: TelemetryCollector): InfraWorkflow {
   const bedrock = new BedrockService(region, modelId, telemetry);
-  const intentAgent = new IntentAgent(bedrock);
+  const clarifyAgent = new ClarifyAgent(bedrock);
   const plannerAgent = new PlannerAgent(bedrock);
   const awsPlannerAgent = new AwsPlannerAgent(bedrock);
   const terraformMcp = new TerraformMcpService(cwd());
   const executorAgent = new ExecutorAgent(terraformMcp);
-  const aggregator = new DebugAggregator();
-  const debuggerAgent = new DebuggerAgent(aggregator, bedrock);
   const askAgent = new AskAgent(bedrock);
-  const awsInventory = new AwsInventoryService();
-  const awsMetrics = new AwsMetricsService();
-  const k8sInventory = new K8sInventoryService();
   const diagnoseAgent = new DiagnoseAgent(bedrock);
   const registryClient = new TerraformRegistryClient();
   return new InfraWorkflow(
-    intentAgent,
+    clarifyAgent,
     plannerAgent,
     awsPlannerAgent,
     executorAgent,
-    debuggerAgent,
     diagnoseAgent,
     askAgent,
-    awsInventory,
-    awsMetrics,
-    k8sInventory,
     registryClient,
     terraformMcp,
     new RateLimiterService(),

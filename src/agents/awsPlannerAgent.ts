@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { BedrockService } from "../services/bedrockService";
-import { AwsExecutionPlan, CloudControlCall, Intent, PlanStep } from "../types";
+import { AwsExecutionPlan, CloudControlCall, PlanStep } from "../types";
 import { parseJsonPayload } from "../utils/llm";
 
 const AwsPlannerOutputSchema = z.object({
@@ -35,10 +35,10 @@ const AwsPlannerOutputSchema = z.object({
 export class AwsPlannerAgent {
   constructor(private readonly bedrock: BedrockService) {}
 
-  async generatePlan(intent: Intent): Promise<AwsExecutionPlan> {
+  async generatePlan(description: string, region = "us-east-1"): Promise<AwsExecutionPlan> {
     const prompt = [
       "You are a senior AWS engineer generating a Cloud Control API execution plan.",
-      "Map the user's intent to an ordered list of AWS Cloud Control operations.",
+      "Map the user's description to an ordered list of AWS Cloud Control operations.",
       "Cloud Control uses CloudFormation resource type names and property schemas.",
       "",
       "OUTPUT: Return ONLY a valid JSON object. No markdown. No extra text.",
@@ -62,7 +62,7 @@ export class AwsPlannerAgent {
       "1. Order calls so dependencies come first (VPC → Subnet → SubnetGroup → DBInstance).",
       "2. Use exact CloudFormation property names (PascalCase). These are the same as CFN templates.",
       "3. Tag every resource: Tags: [{ Key: 'ManagedBy', Value: 'infra-copilot' }, { Key: 'Environment', Value: 'dev' }]",
-      `4. Default region if not in intent: ${intent.region ?? "us-east-1"}`,
+      `4. Default region if not in description: ${region}`,
       "5. RISK: high=IAM/delete/public-access, medium=stateful(RDS/EBS/EKS), low=S3/CloudWatch/tags.",
       "6. For RDS: set SkipFinalSnapshotBeforeDeletion: true, DeletionProtection: false.",
       "7. For IAM roles: AssumeRolePolicyDocument must be a JSON object (not a string).",
@@ -80,8 +80,8 @@ export class AwsPlannerAgent {
       "AWS::DynamoDB::Table       — TableName, BillingMode, AttributeDefinitions, KeySchema",
       "AWS::ElasticLoadBalancingV2::LoadBalancer — Name, Type, Subnets, SecurityGroups",
       "",
-      "INTENT:",
-      JSON.stringify(intent, null, 2),
+      "DESCRIPTION:",
+      description,
     ].join("\n");
 
     const raw = await this.bedrock.complete(prompt, { maxTokens: 8096 });

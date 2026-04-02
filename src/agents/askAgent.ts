@@ -1,226 +1,219 @@
-import { z } from "zod";
+/**
+ * askAgent.ts
+ *
+ * Agentic ReAct loop for AWS inventory / metrics / Kubernetes questions.
+ * Mirrors the DiagnoseAgent pattern exactly.
+ *
+ * The LLM decides at every step what to query — no targets or question-type
+ * classification is pre-computed. The loop continues until the LLM has enough
+ * data to answer confidently and declares done:true.
+ *
+ * Tools available: run_command · aws_query · aws_get · cw_metrics · cw_logs
+ * (same catalog as DiagnoseAgent — parallel fan-out supported)
+ */
+
 import { BedrockService } from "../services/bedrockService";
-import { AskPlan, AskMetricsContext, AwsInventorySnapshot } from "../types";
+import { executeTool, buildToolCatalog, ToolContext } from "../services/diagnoseTools";
 import { parseJsonPayload } from "../utils/llm";
-import { RESOURCE_CATALOG, buildResourceTypeList } from "../services/resourceTypeRegistry";
+import { c, sym, Spinner, printBoxHeader, renderReport } from "../utils/terminal";
 
-// ─── Planner schema ───────────────────────────────────────────────────────────
+// ─── Types ────────────────────────────────────────────────────────────────────
 
-const MetricsContextSchema = z.object({
-  resourceType: z.string(),
-  resourceId: z.string().nullish().transform((v) => v ?? undefined),
-  metrics: z.array(z.string()).default([]),
-  periodHours: z.number().default(1),
-});
+interface Step {
+  tool: string;
+  params: Record<string, string>;
+  thought: string;
+  result: string;
+}
 
-const K8sQuerySchema = z.object({
-  resources: z.array(z.string()).default(["pods"]),
-  namespace: z.string().nullish().transform((v) => v ?? undefined),
-  clusterName: z.string().nullish().transform((v) => v ?? undefined),
-});
+interface ToolCall {
+  tool: string;
+  params: Record<string, string>;
+}
 
-const AskPlanSchema = z.object({
-  targets: z.array(z.string()).default([]),
-  questionType: z.enum(["count", "list", "summary", "metrics", "k8s", "unknown"]).default("unknown"),
-  region: z.string().nullish().transform((v) => (v?.trim() || undefined)),
-  metricsQuery: MetricsContextSchema.nullish().transform((v) => v ?? undefined),
-  k8sQuery: K8sQuerySchema.nullish().transform((v) => v ?? undefined),
-  unsupportedReason: z.string().nullish().transform((v) => v ?? undefined),
-});
+type LLMResponse =
+  | { done: false; thought: string; tool: string;      params: Record<string, string>; calls?: never }
+  | { done: false; thought: string; calls: ToolCall[]; tool?: never; params?: never }
+  | { done: true;  thought: string; answer: string };
 
-// ─── CloudWatch metrics catalog ───────────────────────────────────────────────
+const MAX_STEPS = 15;
 
-const METRICS_CATALOG = `
-CLOUDWATCH METRICS (use for performance/health questions):
-Metrics are available for: ec2, eks, ecs, rds, lambda, alb, elasticache
-Common metric names by resource:
-- ec2:         CPUUtilization, NetworkIn, NetworkOut, DiskReadOps, StatusCheckFailed
-- lambda:      Invocations, Errors, Throttles, Duration, ConcurrentExecutions
-- rds:         CPUUtilization, DatabaseConnections, FreeStorageSpace, ReadIOPS, WriteIOPS
-- ecs:         CPUUtilization, MemoryUtilization
-- alb:         RequestCount, TargetResponseTime, HTTPCode_Target_5XX_Count, ActiveConnectionCount
-- eks:         pod_cpu_utilization, pod_memory_utilization (ContainerInsights)
-- elasticache: CPUUtilization, CurrConnections, CacheHits, CacheMisses, Evictions
-`;
+// ─── History compression ──────────────────────────────────────────────────────
+
+function compressHistory(steps: Step[]): string {
+  if (steps.length === 0) return "(no queries yet)";
+  const recentFrom = Math.max(0, steps.length - 3);
+  return steps
+    .map((s, i) => {
+      if (i >= recentFrom) {
+        const result = s.result.slice(0, 400) + (s.result.length > 400 ? "\n  ...(truncated)" : "");
+        return `[${i + 1}] ${s.tool}(${JSON.stringify(s.params)})\n  → ${s.thought}\n  Result: ${result}`;
+      }
+      const keyLine = s.result.split("\n").find((l) => l.trim().length > 10) ?? s.result;
+      return `[${i + 1}] ${s.tool} → ${keyLine.slice(0, 120)}`;
+    })
+    .join("\n\n");
+}
+
+// ─── System prompt ────────────────────────────────────────────────────────────
+
+const TOOL_NAMES =
+  "Tools: run_command(command) [kubectl/helm/network only — no aws CLI] | " +
+  "aws_query(type,region?,max_results?,filter?) | aws_get(type,identifier,region?) | " +
+  "cw_metrics(namespace,metric,dimensions?,since_hours?,period_minutes?,statistic?,region?) | " +
+  "cw_logs(log_group,filter_pattern?,since_hours?,limit?,region?)\n" +
+  "Parallel: use {\"calls\":[{\"tool\":\"...\",\"params\":{...}},{\"tool\":\"...\",\"params\":{...}}]} to run independent queries concurrently.";
+
+function systemPrompt(question: string, awsRegion: string, steps: Step[]): string {
+  const history = compressHistory(steps);
+  const toolSection = steps.length === 0 ? buildToolCatalog() : TOOL_NAMES;
+
+  return `You are an expert AWS cloud analyst. Answer the user's question by querying live AWS data.
+Think like a cloud architect: pick the most relevant data source, fetch just enough to answer accurately.
+
+${toolSection}
+
+RESPONSE FORMAT — ONE valid JSON object, no markdown fences:
+
+Single tool:   {"thought":"...","tool":"tool_name","params":{...},"done":false}
+Parallel:      {"thought":"...","calls":[{"tool":"...","params":{...}},{...}],"done":false}
+Answer:        {"thought":"...","done":true,"answer":"Direct answer here with specific values, counts, and resource names from the data"}
+
+RULES:
+- Use aws_query/aws_get for resource inventory questions (EC2, EKS, RDS, S3, VPC, IAM, ALB…).
+- Use cw_metrics for performance / health questions (CPU, memory, errors, latency, connections).
+- Use cw_logs for log-based questions (errors, recent events, request logs).
+- Use run_command (kubectl) for in-cluster Kubernetes questions.
+- Fetch in parallel when multiple independent data sources are needed.
+- Conclude as soon as you have enough to answer — don't over-query.
+- answer must be specific: include names, IDs, counts, metric values from the actual data.
+
+QUESTION : ${question}
+REGION   : ${awsRegion}
+TIME     : ${new Date().toISOString()}
+
+QUERY HISTORY:
+${history}
+
+Your next action:`;
+}
+
+// ─── Agent ────────────────────────────────────────────────────────────────────
 
 export class AskAgent {
   constructor(private readonly bedrock: BedrockService) {}
 
-  async plan(question: string): Promise<AskPlan> {
-    const prompt = [
-      "You are an AWS inventory and metrics query planner.",
-      "Given a natural-language question about AWS, produce a JSON execution plan.",
-      "",
-      RESOURCE_CATALOG,
-      "",
-      METRICS_CATALOG,
-      "",
-      "KUBERNETES RESOURCES (use k8s questionType for in-cluster questions):",
-      "  - pods, namespaces, deployments, services, statefulsets, daemonsets,",
-      "    nodes, ingresses, configmaps, jobs, cronjobs, events, replicasets, pvcs",
-      "  - Use questionType='k8s' and populate k8sQuery when the question is about",
-      "    resources INSIDE a cluster (pods, namespaces, deployments, etc.)",
-      "  - Use questionType='list' + targets=['eks'] when asking about the EKS clusters themselves.",
-      "",
-      "RULES:",
-      "1. For list/count/existence questions about AWS resources → targets = CF types, questionType = 'count'|'list'|'summary'.",
-      "2. For in-cluster k8s questions (pods, namespaces, deployments, services) → questionType='k8s', populate k8sQuery.",
-      "3. For performance/health/metrics questions (CPU, memory, errors, latency) → questionType='metrics', populate metricsQuery.",
-      "4. For broad questions ('give me everything') → select all relevant services, questionType='summary'.",
-      "5. If a specific AWS region is mentioned (e.g. ap-south-1, us-west-2) → extract it into 'region'.",
-      "6. Prefer answering over refusing — almost all AWS/k8s questions can be answered.",
-      "",
-      "OUTPUT: Return ONLY valid JSON. No markdown fences. No explanation.",
-      "",
-      "JSON SCHEMA:",
-      JSON.stringify({
-        targets: ["eks"],
-        questionType: "count|list|summary|metrics|k8s|unknown",
-        region: "ap-south-1 (optional)",
-        metricsQuery: {
-          resourceType: "ec2|eks|lambda|rds|ecs|alb|elasticache",
-          resourceId: "optional",
-          metrics: ["CPUUtilization"],
-          periodHours: 1,
-        },
-        k8sQuery: {
-          resources: ["pods", "namespaces"],
-          namespace: "optional — omit for all-namespaces",
-          clusterName: "optional EKS cluster name",
-        },
-        unsupportedReason: "optional",
-      }),
-      "",
-      `USER QUESTION: ${question}`,
-    ].join("\n");
+  async run(question: string, awsRegion: string, k8sContext?: string): Promise<string> {
+    console.log("");
+    printBoxHeader(`Asking · ${question.slice(0, 60)}`);
+    console.log("");
 
-    const response = await this.bedrock.complete(prompt);
-    const normalized = AskPlanSchema.parse(parseJsonPayload(response, "Ask planner"));
+    const ctx: ToolContext = { awsRegion, k8sContext };
+    const steps: Step[] = [];
+    let finalAnswer = "";
+    let stepNum = 0;
 
-    // If nothing was selected but it's not unknown/metrics, fall back to broad summary
-    if (normalized.targets.length === 0 && normalized.questionType !== "metrics" && normalized.questionType !== "unknown") {
-      const broadTargets = buildResourceTypeList([
-        "ec2", "eks", "ecs", "s3", "rds", "lambda", "dynamodb",
-        "sqs", "sns", "vpc", "iam", "alb", "cloudformation",
-      ]);
-      return { targets: broadTargets, questionType: "summary" };
-    }
-    // Resolve aliases → CloudFormation type strings
-    return { ...normalized, targets: buildResourceTypeList(normalized.targets) };
-  }
+    while (stepNum < MAX_STEPS) {
+      stepNum++;
 
-  async answer(
-    question: string,
-    snapshot: AwsInventorySnapshot,
-    metricsSnapshot?: string,
-    k8sSnapshot?: string,
-  ): Promise<string> {
-    const inventorySummary = this.formatSnapshotForLLM(snapshot);
-
-    const sections = [
-      "You are an AWS infrastructure assistant.",
-      "Answer the user's question using ONLY the live AWS data provided below.",
-      "Never invent resources, counts, metrics, costs, or states not in the data.",
-      "",
-      "ANSWER STYLE:",
-      "- First sentence: the direct answer.",
-      "- Use ## for sections, **name** for resource names, - for bullet lists.",
-      "- Include counts, versions, status, and metric values where available.",
-      "- If a service errored, mention it briefly (e.g. 'ECS data unavailable: access denied').",
-      "",
-      `USER QUESTION: ${question}`,
-      "",
-      `LIVE AWS INVENTORY  (account: ${snapshot.accountId ?? "?"}, region: ${snapshot.region}, as of ${snapshot.generatedAt}):`,
-      "",
-      inventorySummary,
-    ];
-
-    if (metricsSnapshot) {
-      sections.push("", "LIVE CLOUDWATCH METRICS:", "", metricsSnapshot);
-    }
-
-    if (k8sSnapshot) {
-      sections.push("", "LIVE KUBERNETES DATA:", "", k8sSnapshot);
-    }
-
-    return this.bedrock.complete(sections.join("\n"), { maxTokens: 2000 });
-  }
-
-  // ─── Snapshot formatter ───────────────────────────────────────────────────
-
-  formatSnapshotForLLM(snapshot: AwsInventorySnapshot): string {
-    const lines: string[] = [];
-
-    for (const [service, result] of Object.entries(snapshot.services)) {
-      if (!result) continue;
-      if (result.error) {
-        lines.push(`${service.toUpperCase()} — ERROR: ${result.error}`);
-        lines.push("");
+      // ── Ask LLM what to query next ───────────────────────────────────────
+      const sp = new Spinner().start(`Step ${stepNum}/${MAX_STEPS}  ·  thinking…`);
+      let raw: string;
+      try {
+        raw = await this.bedrock.complete(systemPrompt(question, awsRegion, steps), { maxTokens: 1024 });
+      } catch (err) {
+        sp.fail(`Step ${stepNum} — LLM error`);
+        steps.push({ tool: "_error", params: {}, thought: "LLM call failed", result: String(err) });
         continue;
       }
-      lines.push(`${service.toUpperCase()} (${result.count} total):`);
-      if (result.items.length === 0) {
-        lines.push("  (none found)");
-      } else {
-        for (const item of result.items as Record<string, unknown>[]) {
-          lines.push("  - " + this.formatItem(service, item));
-        }
+      sp.fail(""); // clear spinner line
+
+      // ── Parse ─────────────────────────────────────────────────────────────
+      let parsed: LLMResponse;
+      try {
+        parsed = parseJsonPayload(raw, `ask step ${stepNum}`) as LLMResponse;
+      } catch {
+        process.stdout.write(
+          `\n  ${c.dim(`[${stepNum}]`)} ${c.red("parse error")}  ${c.dim(raw.slice(0, 100))}\n`,
+        );
+        steps.push({ tool: "_parse_error", params: {}, thought: "unparseable", result: raw.slice(0, 300) });
+        continue;
       }
-      lines.push("");
+
+      // ── Done? ─────────────────────────────────────────────────────────────
+      if (parsed.done) {
+        process.stdout.write(
+          `\n  ${c.bold(c.green(sym.check))} ${c.dim(`[${stepNum}]`)} ${c.bold("answer ready")}  ` +
+          `${c.dim(parsed.thought.slice(0, 80))}\n`,
+        );
+        finalAnswer = (parsed as { done: true; answer: string }).answer;
+        break;
+      }
+
+      // ── Parallel calls ────────────────────────────────────────────────────
+      if ((parsed as { calls?: ToolCall[] }).calls?.length) {
+        const { thought, calls } = parsed as { done: false; thought: string; calls: ToolCall[] };
+        process.stdout.write(
+          `\n  ${c.bold(c.cyan(sym.dot))} ${c.dim(`[${stepNum}]`)} ${c.bold(`parallel ×${calls.length}`)}` +
+          `  ${c.dim("→")} ${thought.slice(0, 80)}\n`,
+        );
+        const results = await Promise.all(
+          calls.map(async (call) => ({
+            call,
+            result: await executeTool(call.tool, call.params, ctx),
+          })),
+        );
+        for (const { call, result } of results) {
+          const preview = result.split("\n")[0].slice(0, 100);
+          process.stdout.write(`         ${c.bold(call.tool)}  ${c.dim(preview)}\n`);
+          steps.push({ tool: call.tool, params: call.params, thought, result });
+        }
+        stepNum += calls.length - 1;
+        continue;
+      }
+
+      // ── Single tool call ──────────────────────────────────────────────────
+      const { tool, params, thought } = parsed as { done: false; tool: string; params: Record<string, string>; thought: string };
+      process.stdout.write(
+        `\n  ${c.bold(c.cyan(sym.dot))} ${c.dim(`[${stepNum}]`)} ${c.bold(tool)}` +
+        `  ${c.dim("→")} ${thought.slice(0, 90)}\n`,
+      );
+      const result = await executeTool(tool, params, ctx);
+      const preview = result.split("\n")[0].slice(0, 100);
+      process.stdout.write(`         ${c.dim(preview)}\n`);
+      steps.push({ tool, params, thought, result });
     }
-    return lines.join("\n");
-  }
 
-  private formatItem(service: string, item: Record<string, unknown>): string {
-    switch (service) {
-      case "ec2":
-        return `${item["instanceId"]} (${item["instanceType"]}, ${item["state"]}, ${item["availabilityZone"] ?? "?"})` +
-          (item["name"] ? ` [${item["name"]}]` : "");
-      case "eks":
-        return `${item["name"]}  status=${item["status"]}  k8s=${item["kubernetesVersion"]}  nodegroups=${item["nodegroupCount"]}`;
-      case "ecs":
-        return `${item["clusterName"]}  status=${item["status"]}  activeServices=${item["activeServicesCount"]}  runningTasks=${item["runningTasksCount"]}`;
-      case "ecr":
-        return `${item["repositoryName"]}  images=${item["imageCount"] ?? "?"}  pushed=${item["lastPushed"] ?? "unknown"}`;
-      case "s3":
-        return `${item["name"]}` + (item["createdAt"] ? `  created=${(item["createdAt"] as string).slice(0, 10)}` : "");
-      case "rds":
-        return `${item["identifier"]}  ${item["engine"]} ${item["engineVersion"]}  ${item["instanceClass"]}  status=${item["status"]}` +
-          (item["multiAz"] ? "  multi-az" : "");
-      case "elasticache":
-        return `${item["clusterId"]}  engine=${item["engine"]}  nodeType=${item["cacheNodeType"]}  status=${item["cacheClusterStatus"]}`;
-      case "lambda":
-        return `${item["name"]}  runtime=${item["runtime"]}  memory=${item["memorySizeMb"]}MB  timeout=${item["timeoutSec"]}s`;
-      case "dynamodb":
-        return `${item["name"]}`;
-      case "sqs":
-        return `${item["name"]}`;
-      case "sns":
-        return `${item["name"]}`;
-      case "vpc":
-        return `${item["vpcId"]}  cidr=${item["cidrBlock"]}  state=${item["state"]}` +
-          (item["isDefault"] ? "  [default]" : "") +
-          (item["name"] ? `  [${item["name"]}]` : "");
-      case "iam":
-        return `${item["roleName"]}`;
-      case "cloudformation":
-        return `${item["stackName"]}  status=${item["stackStatus"]}  resources=${item["resourceCount"] ?? "?"}` +
-          (item["description"] ? `  — ${item["description"]}` : "");
-      case "route53":
-        return `${item["name"]}  records=${item["resourceRecordSetCount"] ?? "?"}  private=${item["privateZone"] ?? false}`;
-      case "alb":
-        return `${item["loadBalancerName"]}  scheme=${item["scheme"]}  state=${item["state"]}  dns=${item["dnsName"]}`;
-      default:
-        return JSON.stringify(item);
+    // ── Force answer if loop exhausted ───────────────────────────────────────
+    if (!finalAnswer) {
+      const sp = new Spinner().start("Synthesising answer…");
+      try {
+        const forcePrompt =
+          systemPrompt(question, awsRegion, steps) +
+          "\n\nYou have reached the step limit. Answer now with done:true using all data gathered so far.";
+        const raw2 = await this.bedrock.complete(forcePrompt, { maxTokens: 2048 });
+        const p2 = parseJsonPayload(raw2, "ask force-answer") as LLMResponse;
+        finalAnswer = p2.done
+          ? (p2 as { done: true; answer: string }).answer
+          : buildFallbackAnswer(steps);
+        sp.succeed("Answer synthesised");
+      } catch {
+        sp.fail("Could not synthesise answer");
+        finalAnswer = buildFallbackAnswer(steps);
+      }
     }
-  }
 
-  /** Human-readable description for spinner. */
-  describeMetricsQuery(ctx: AskMetricsContext): string {
-    return `${ctx.resourceType.toUpperCase()} — ${ctx.metrics.join(", ")} — last ${ctx.periodHours}h`;
+    console.log("");
+    return renderReport(finalAnswer);
   }
+}
 
-  describeK8sQuery(q: import("../types").AskK8sQuery): string {
-    return `${q.resources.join(", ")}${q.clusterName ? ` in ${q.clusterName}` : ""}`;
-  }
+// ─── Fallback ─────────────────────────────────────────────────────────────────
+
+function buildFallbackAnswer(steps: Step[]): string {
+  const evidence = steps
+    .filter((s) => !s.tool.startsWith("_"))
+    .map((s) => `**[${s.tool}]:** ${s.result.slice(0, 300)}`)
+    .join("\n\n");
+  return `## Data Collected\n\n${evidence || "No data was successfully retrieved."}`;
 }

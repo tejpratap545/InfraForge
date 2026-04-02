@@ -1,19 +1,24 @@
 /**
  * diagnoseAgent.ts
  *
- * Agentic ReAct loop — works like Claude Code / Codex.
+ * Single agentic ReAct loop for all infrastructure investigation.
+ * Handles both:
+ *   - Free-form questions: "why is mimir crashing?"
+ *   - Service-anchored debug: --service checkout-api + DebugOptions
  *
- * The LLM gets six generic primitives and decides at every step what to investigate.
- * No cases are pre-defined. The loop continues until the LLM declares done.
+ * The LLM gets six generic primitives and decides at every step what to
+ * investigate. No cases are pre-defined. The loop continues until the LLM
+ * declares done.
  *
  * Parallel fan-out: the LLM may return a `calls` array to run independent
- * AWS / K8s queries concurrently (Promise.all) in a single logical step.
+ * queries concurrently (Promise.all) in a single logical step.
  */
 
 import { BedrockService } from "../services/bedrockService";
 import { executeTool, buildToolCatalog, ToolContext } from "../services/diagnoseTools";
 import { parseJsonPayload } from "../utils/llm";
 import { c, sym, Spinner, printBoxHeader, renderReport } from "../utils/terminal";
+import { DebugOptions } from "../types";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -37,10 +42,6 @@ type LLMResponse =
 const MAX_STEPS = 20;
 
 // ─── History compression ──────────────────────────────────────────────────────
-//
-// Keeps input tokens flat as steps accumulate:
-//   - Last 3 steps: full result (400 chars) — LLM needs recent context
-//   - Older steps:  single summary line      — LLM only needs the key finding
 
 function compressHistory(steps: Step[]): string {
   if (steps.length === 0) return "(no steps yet)";
@@ -59,7 +60,6 @@ function compressHistory(steps: Step[]): string {
 
 // ─── System prompt ────────────────────────────────────────────────────────────
 
-// Short tool reference — sent after step 0 to avoid re-sending the full catalog (~1,700 tokens) every call.
 const TOOL_NAMES =
   "Tools: run_command(command) [kubectl/helm/network only — no aws CLI] | " +
   "aws_query(type,region?,max_results?,filter?) | aws_get(type,identifier,region?) | " +
@@ -67,16 +67,24 @@ const TOOL_NAMES =
   "cw_logs(log_group,filter_pattern?,since_hours?,limit?,region?)\n" +
   "Parallel: use {\"calls\":[{\"tool\":\"...\",\"params\":{...}},{\"tool\":\"...\",\"params\":{...}}]} to run independent queries concurrently.";
 
-function systemPrompt(question: string, awsRegion: string, steps: Step[]): string {
+function systemPrompt(question: string, awsRegion: string, steps: Step[], options: DebugOptions): string {
   const history = compressHistory(steps);
   const toolSection = steps.length === 0 ? buildToolCatalog() : TOOL_NAMES;
+
+  // Extra context injected when called from the `debug` command
+  const extraCtx: string[] = [];
+  if (options.namespace)     extraCtx.push(`Kubernetes namespace: ${options.namespace}`);
+  if (options.since)         extraCtx.push(`Look-back window: ${options.since}`);
+  if (options.lokiUrl)       extraCtx.push(`Loki URL: ${options.lokiUrl} — query via run_command(curl)`);
+  if (options.openSearchUrl) extraCtx.push(`OpenSearch URL: ${options.openSearchUrl} — query via run_command(curl)`);
+  const extraSection = extraCtx.length > 0 ? `\nCONTEXT:\n${extraCtx.join("\n")}\n` : "";
 
   return `You are an expert SRE agent investigating a live infrastructure problem.
 You have access to six tools. You decide WHAT to run at every step — no cases are pre-defined.
 Think like a senior engineer: start broad, narrow down, follow evidence.
 
 ${toolSection}
-
+${extraSection}
 RESPONSE FORMAT — ONE valid JSON object, no markdown fences:
 
 Single tool:   {"thought":"...","tool":"tool_name","params":{...},"done":false}
@@ -98,12 +106,12 @@ Your next action:`;
 export class DiagnoseAgent {
   constructor(private readonly bedrock: BedrockService) {}
 
-  async run(question: string, awsRegion: string, k8sContext?: string): Promise<string> {
+  async run(question: string, awsRegion: string, options: DebugOptions = {}): Promise<string> {
     console.log("");
-    printBoxHeader(`Diagnosing · ${question.slice(0, 60)}`);
+    printBoxHeader(`Investigating · ${question.slice(0, 60)}`);
     console.log("");
 
-    const ctx: ToolContext = { awsRegion, k8sContext };
+    const ctx: ToolContext = { awsRegion, k8sContext: options.k8sContext };
     const steps: Step[] = [];
     let finalAnswer = "";
     let stepNum = 0;
@@ -115,7 +123,7 @@ export class DiagnoseAgent {
       const sp = new Spinner().start(`Step ${stepNum}/${MAX_STEPS}  ·  thinking…`);
       let raw: string;
       try {
-        raw = await this.bedrock.complete(systemPrompt(question, awsRegion, steps), {
+        raw = await this.bedrock.complete(systemPrompt(question, awsRegion, steps, options), {
           maxTokens: 1024,
         });
       } catch (err) {
@@ -169,7 +177,6 @@ export class DiagnoseAgent {
           steps.push({ tool: call.tool, params: call.params, thought, result });
         }
 
-        // Each parallel call counts as a step toward the limit
         stepNum += calls.length - 1;
         continue;
       }
@@ -194,7 +201,7 @@ export class DiagnoseAgent {
       const sp = new Spinner().start("Summarising findings…");
       try {
         const forcePrompt =
-          systemPrompt(question, awsRegion, steps) +
+          systemPrompt(question, awsRegion, steps, options) +
           "\n\nYou have reached the step limit. Conclude now with done=true using all evidence gathered.";
         const raw2 = await this.bedrock.complete(forcePrompt, { maxTokens: 2048 });
         const p2 = parseJsonPayload(raw2, "force-conclusion") as LLMResponse;
