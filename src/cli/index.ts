@@ -9,7 +9,6 @@ import { DebuggerAgent } from "../agents/debuggerAgent";
 import { DiagnoseAgent } from "../agents/diagnoseAgent";
 import { AskAgent } from "../agents/askAgent";
 import { DebugAggregator } from "../providers/debugAggregator";
-import { ServiceDiscovery } from "../services/serviceDiscovery";
 import { AwsInventoryService } from "../services/awsInventoryService";
 import { AwsMetricsService } from "../services/awsMetricsService";
 import { K8sInventoryService } from "../services/k8sInventoryService";
@@ -48,7 +47,7 @@ function makeWorkflow(region: string, modelId?: string, telemetry?: TelemetryCol
   const awsInventory = new AwsInventoryService();
   const awsMetrics = new AwsMetricsService();
   const k8sInventory = new K8sInventoryService();
-  const diagnoseAgent = new DiagnoseAgent(bedrock, new ServiceDiscovery(), aggregator, k8sInventory, awsMetrics);
+  const diagnoseAgent = new DiagnoseAgent(bedrock);
   const registryClient = new TerraformRegistryClient();
   return new InfraWorkflow(
     intentAgent,
@@ -109,48 +108,71 @@ async function run(): Promise<void> {
   program
     .command("create")
     .description("Parse intent, generate plan, ask approval, then execute.")
-    .requiredOption("-i, --input <intent>", "natural language input")
-    .action(async (cmd) => {
+    .action(async () => {
+      const opts = program.opts<{ input?: string; engine: "terraform" | "aws" }>();
+      if (!opts.input) {
+        console.error("--input <intent> is required for the create command");
+        process.exitCode = 1;
+        return;
+      }
       const tenant = buildTenant();
-      const { engine } = program.opts<{ engine: "terraform" | "aws" }>();
       const workflow = makeWorkflow(tenant.awsRegion);
-      if (engine === "aws") {
-        await workflow.createWithAwsSdk(cmd.input, tenant);
+      if (opts.engine === "aws") {
+        await workflow.createWithAwsSdk(opts.input, tenant);
       } else {
-        await workflow.createOrUpdate(cmd.input, tenant);
+        await workflow.createOrUpdate(opts.input, tenant);
       }
     });
 
   program
     .command("plan")
     .description("Generate and run terraform plan only.")
-    .requiredOption("-i, --input <intent>", "natural language input")
-    .action(async (cmd) => {
+    .action(async () => {
+      const opts = program.opts<{ input?: string }>();
+      if (!opts.input) {
+        console.error("--input <intent> is required for the plan command");
+        process.exitCode = 1;
+        return;
+      }
       const tenant = buildTenant();
       const workflow = makeWorkflow(tenant.awsRegion);
-      await workflow.planOnly(cmd.input, tenant);
+      await workflow.planOnly(opts.input, tenant);
     });
 
   program
     .command("update")
     .description("Read an existing Terraform directory, patch files with LLM, then plan & apply.")
-    .requiredOption("-d, --tf-dir <path>", "path to existing Terraform directory")
-    .requiredOption("-i, --input <instruction>", "plain-language change description")
-    .action(async (cmd) => {
+    .action(async () => {
       const { resolve } = await import("node:path");
+      const opts = program.opts<{ tfDir?: string; input?: string }>();
+      if (!opts.tfDir) {
+        console.error("--tf-dir <path> is required for the update command");
+        process.exitCode = 1;
+        return;
+      }
+      if (!opts.input) {
+        console.error("--input <instruction> is required for the update command");
+        process.exitCode = 1;
+        return;
+      }
       const tenant = buildTenant();
       const workflow = makeWorkflow(tenant.awsRegion);
-      await workflow.updateExisting(cmd.input, resolve(cmd.tfDir), tenant);
+      await workflow.updateExisting(opts.input, resolve(opts.tfDir), tenant);
     });
 
   program
     .command("apply")
     .description("Generate plan and apply only after confirmation.")
-    .requiredOption("-i, --input <intent>", "natural language input")
-    .action(async (cmd) => {
+    .action(async () => {
+      const opts = program.opts<{ input?: string }>();
+      if (!opts.input) {
+        console.error("--input <intent> is required for the apply command");
+        process.exitCode = 1;
+        return;
+      }
       const tenant = buildTenant();
       const workflow = makeWorkflow(tenant.awsRegion);
-      await workflow.applyExisting(cmd.input, tenant);
+      await workflow.applyExisting(opts.input, tenant);
     });
 
   program
