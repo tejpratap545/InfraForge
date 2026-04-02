@@ -1,33 +1,44 @@
 /**
- * Strips markdown code fences from LLM responses.
- * Many models wrap JSON in ```json ... ``` blocks even when instructed not to.
+ * Extract the outermost JSON object from an LLM response.
  *
- * Uses lastIndexOf for the closing fence so that:
- *  - HCL content inside JSON string values that contains ``` doesn't trip the parser.
- *  - Extra text the model appends after the closing fence is ignored.
+ * Handles all common LLM formatting problems:
+ *   - Markdown code fences (```json ... ```)
+ *   - Preamble text before the JSON object ("Here is my response: {...")
+ *   - Trailing text after the closing brace
+ *   - Actual newlines inside string values (replaces them with \n)
  */
 export function extractJsonPayload(response: string): string {
-  const trimmed = response.trim();
+  let text = response.trim();
 
-  // Fast path: already bare JSON.
-  if (trimmed.startsWith("{") || trimmed.startsWith("[")) return trimmed;
-
-  // Strip an opening code fence (```json or ```).
-  if (trimmed.startsWith("```")) {
-    const withoutOpen = trimmed.replace(/^```(?:json)?\s*/i, "");
-    // Find the FIRST closing fence that appears AFTER the opening brace,
-    // so backtick sequences inside JSON string values don't trip the parser.
-    const bracePos = withoutOpen.indexOf("{");
-    if (bracePos === -1) return withoutOpen.trim();
-    const searchFrom = bracePos;
-    const closingFence = withoutOpen.indexOf("\n```", searchFrom);
-    if (closingFence !== -1) return withoutOpen.slice(0, closingFence).trim();
-    // No closing fence found — return everything after the opening fence.
-    return withoutOpen.trim();
+  // Strip markdown code fences
+  if (text.startsWith("```")) {
+    text = text.replace(/^```(?:json)?\s*/i, "");
+    const fence = text.indexOf("\n```");
+    if (fence !== -1) text = text.slice(0, fence);
+    text = text.trim();
   }
 
-  // No fence — return as-is and let JSON.parse surface the error.
-  return trimmed;
+  // Find the first { and extract the matching outermost JSON object.
+  // This handles preamble text AND trailing text after the JSON.
+  const start = text.indexOf("{");
+  if (start === -1) return text; // no JSON object found — let JSON.parse fail
+
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (escape)            { escape = false; continue; }
+    if (ch === "\\")       { escape = true;  continue; }
+    if (ch === '"')        { inString = !inString; continue; }
+    if (inString)          { continue; }
+    if (ch === "{")        { depth++; }
+    else if (ch === "}")   { depth--; if (depth === 0) return text.slice(start, i + 1); }
+  }
+
+  // Unmatched braces — return from start to end and let JSON.parse fail with a clear error
+  return text.slice(start);
 }
 
 /**

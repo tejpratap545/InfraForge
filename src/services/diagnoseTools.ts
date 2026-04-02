@@ -114,6 +114,29 @@ function awsConfig(ctx: ToolContext, regionOverride?: string) {
   };
 }
 
+/**
+ * Coerce a tool param value to a plain string.
+ * The LLM sometimes passes arrays (["val1","val2"]) or objects instead of strings.
+ * Arrays are joined with comma; objects are JSON-stringified; nullish → "".
+ */
+function paramStr(v: unknown): string {
+  if (v === undefined || v === null) return "";
+  if (typeof v === "string") return v;
+  if (Array.isArray(v)) return v.join(",");
+  return JSON.stringify(v);
+}
+
+/**
+ * Normalize all values in a params object to strings.
+ * Prevents "x.trim is not a function" crashes when the LLM generates
+ * array or object values instead of plain strings.
+ */
+function normalizeParams(p: Record<string, unknown>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(p)) out[k] = paramStr(v);
+  return out;
+}
+
 // ─── Safety blocklist for run_command ────────────────────────────────────────
 // Only blocks destructive operations. All read/diagnostic commands pass.
 
@@ -788,12 +811,12 @@ export async function cloudtrail_lookup(
   params: Record<string, string>,
   ctx: ToolContext,
 ): Promise<string> {
-  const r          = params["region"]?.trim() || ctx.awsRegion;
-  const sinceHours = parseFloat(params["since_hours"] ?? "3");
-  const maxResults = Math.min(parseInt(params["max_results"] ?? "25", 10), 50);
-  const eventName  = params["event_name"]?.trim();
-  const resource   = params["resource_name"]?.trim();
-  const username   = params["username"]?.trim();
+  const r          = paramStr(params["region"]).trim() || ctx.awsRegion;
+  const sinceHours = parseFloat(paramStr(params["since_hours"]) || "3");
+  const maxResults = Math.min(parseInt(paramStr(params["max_results"]) || "25", 10), 50);
+  const eventName  = paramStr(params["event_name"]).trim() || undefined;
+  const resource   = paramStr(params["resource_name"]).trim() || undefined;
+  const username   = paramStr(params["username"]).trim() || undefined;
   const ct         = new CloudTrailClient(awsConfig(ctx, r));
 
   const StartTime = new Date(Date.now() - sinceHours * 3_600_000);
@@ -1394,9 +1417,11 @@ export function buildToolCatalog(mcpTools?: AwsMcpTool[]): string {
 
 export async function executeTool(
   name: string,
-  params: Record<string, string>,
+  rawParams: Record<string, unknown>,
   ctx: ToolContext,
 ): Promise<string> {
+  // Normalize all param values to strings — the LLM sometimes sends arrays or objects
+  const params = normalizeParams(rawParams);
   switch (name) {
     case "run_command":       return run_command(params, ctx);
     case "aws_query":         return aws_query(params, ctx);
@@ -1416,6 +1441,11 @@ export async function executeTool(
     case "k8s_logs":          return k8s_logs(params, ctx);
     case "aws_cli":           return aws_cli(params, ctx);
     case "mcp_tool":          return mcp_tool(params, ctx);
+    // Common LLM format mistakes — return corrective messages
+    case "parallel":
+      return `FORMAT ERROR: "parallel" is not a tool name. Use {"calls":[{"tool":"...","params":{...}},{"tool":"...","params":{...}}]} for parallel calls.`;
+    case "done":
+      return `FORMAT ERROR: "done" is not a tool. To conclude, respond with {"thought":"...","done":true,"answer":"..."}.`;
     default: {
       // Auto-route MCP tool names
       if (ctx.mcpService?.isConnected()) {

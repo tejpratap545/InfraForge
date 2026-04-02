@@ -368,6 +368,26 @@ export class AwsMcpService {
     return this.slots.length > 0;
   }
 
+  /**
+   * Connect a specific set of MCP servers by name (bypasses AWS_MCP_SERVERS env var).
+   * Called after service routing so only relevant servers are connected.
+   * Safe to call multiple times — skips servers already connected.
+   */
+  async connectForServices(serverNames: string[]): Promise<boolean> {
+    if (serverNames.length === 0) return false;
+    this.attempted = true;
+
+    const alreadyConnected = new Set(this.slots.map((s) => s.serverName));
+    const toConnect = serverNames.filter((n) => !alreadyConnected.has(n));
+
+    if (toConnect.length > 0) {
+      await Promise.all(toConnect.map((name) => this.connectNamedServer(name)));
+      this.buildToolIndex();
+    }
+
+    return this.slots.length > 0;
+  }
+
   async disconnect(): Promise<void> {
     await Promise.all(
       this.slots.map((s) => s.client.close().catch(() => {})),
@@ -520,7 +540,9 @@ export class AwsMcpService {
     };
 
     try {
-      const transport = new StdioClientTransport({ command: resolved.path, args, env });
+      // Redirect child stderr to "pipe" so failed MCP servers (e.g. mysql missing --secret_arn)
+      // don't print error messages into the user's terminal.
+      const transport = new StdioClientTransport({ command: resolved.path, args, env, stderr: "pipe" });
       const client    = new Client({ name: "infra-copilot", version: "1.0.0" }, { capabilities: {} });
       await client.connect(transport);
       const tools = await discoverTools(client, serverName);

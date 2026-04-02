@@ -33,6 +33,7 @@ import { AwsMcpService } from "../services/awsMcpService";
 import { parseJsonPayload } from "../utils/llm";
 import { c, sym, Spinner, printBoxHeader, renderReport } from "../utils/terminal";
 import { runPreflight } from "../utils/preflight";
+import { routeQuestion } from "../utils/serviceRouter";
 import { DebugOptions, AwsCredentials } from "../types";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -292,6 +293,12 @@ TOOL SELECTION GUIDE:
 10. ONE HYPOTHESIS AT A TIME — don't run 3 different theories in parallel. Pick the
     most likely one, test it, then pivot if disproved.
 11. NO DATAPOINTS → DISCOVER FIRST — if cw_metrics returns "No datapoints", run
+12. THE PROBLEM STATEMENT IS AN ALLEGATION, NOT A FACT — the user's description of
+    the symptom may be wrong, exaggerated, or already resolved. You MUST verify every
+    claim with actual data. If metrics show normal values (e.g. DBLoad=4%, CPU=12%),
+    report that directly: "Metrics are normal — no anomaly confirmed." Do NOT invent
+    a problem to match the user's framing. Trust the data, not the description.
+    If all signals are healthy, conclude with "No anomaly found" and explain what you checked.
     aws_cli("aws cloudwatch list-metrics --namespace <same-ns> --dimensions Name=<dim>,Value=<val> --region <r>")
     BEFORE retrying. Use the exact metric names and dimension values shown in that output.
 
@@ -299,15 +306,27 @@ TOOL SELECTION GUIDE:
 
 Single tool:   {"thought":"<hypothesis being tested>","tool":"<name>","params":{...},"done":false}
 Parallel:      {"thought":"<triage rationale>","calls":[{"tool":"...","params":{...}},...],"done":false}
-Conclusion:    {"thought":"<evidence chain summary>","done":true,"answer":"<see format below>"}
+Conclusion:    {"thought":"<evidence chain summary>","done":true,"answer":"<PLAIN MARKDOWN STRING — not a JSON object, not nested keys>"}
+
+CRITICAL: The "answer" field MUST be a single plain markdown string (with literal \n for newlines).
+Do NOT make "answer" a JSON object with section keys like {"## Root Cause": "..."}. That breaks rendering.
+Correct:   {"done":true,"thought":"...","answer":"## Root Cause\nThe DB is slow because...\n\n## Evidence Chain\n1. ..."}
+WRONG:     {"done":true,"thought":"...","answer":{"## Root Cause":"The DB is slow..."}}
 
 CONCLUSION FORMAT — be specific and actionable:
 
+IF AN ANOMALY EXISTS:
 ## Incident Summary
 **Severity**: P1/P2/P3 | **Impact**: [what is broken, who is affected, scope] | **Duration**: [start → end or ongoing]
 
 ## Root Cause
 [One clear sentence: WHAT failed, WHY it failed, and WHEN it started. Include the specific component, change, or condition.]
+
+IF NO ANOMALY IS FOUND (all metrics are normal):
+## No Anomaly Detected
+**Checked**: [list what you measured — metrics, logs, health checks]
+**Findings**: [actual values observed, e.g. "DBLoad avg=0.04 (normal), CPU=12%, connections=45"]
+**Conclusion**: The reported symptom is not confirmed by data as of [timestamp]. [Optional: what to watch if it recurs.]
 
 ## Evidence Chain
 1. [First signal]: [exact values with timestamps]
@@ -358,7 +377,8 @@ function getPhaseHint(steps: Step[], findings: Finding[]): string {
   • Logs: cw_logs for recent errors in the affected service
   • Infrastructure: cw_metrics for CPU/memory/connections
 → Goal: determine SCOPE (all users? one service? one AZ?) and TIMING (when did it start?)
-→ DO NOT deep-dive yet. Breadth first, depth second.`;
+→ DO NOT deep-dive yet. Breadth first, depth second.
+→ IMPORTANT: If the data shows normal values, that IS the finding — do not search harder to confirm the user's claim.`;
   }
 
   if (n <= 5) {
@@ -422,25 +442,21 @@ export class DiagnoseAgent {
     printBoxHeader(`Investigating · ${question.slice(0, 60)}`);
     console.log("");
 
-    // ── Try to connect AWS MCP servers (non-blocking) ────────────────────────
-    if (this.mcpService && !this.mcpService.isConnected()) {
-      const sp = new Spinner().start("Connecting to AWS MCP servers…");
-      const ok = await this.mcpService.connect();
-      if (ok) {
-        const servers = this.mcpService.getConnectedServers();
-        const count   = this.mcpService.getDiscoveredTools().length;
-        sp.succeed(
-          `AWS MCP  ${c.dim("·")}  ${c.bold(servers.join(", "))}  ` +
-          `${c.dim(`·  ${count} tool${count !== 1 ? "s" : ""} available`)}`,
-        );
-      } else {
-        sp.fail(
-          c.dim("AWS MCP not configured — using SDK tools only") + "\n" +
-          c.dim("  → Install uv to enable:  curl -LsSf https://astral.sh/uv/install.sh | sh") + "\n" +
-          c.dim("  → Then set:              AWS_MCP_SERVERS=cloudwatch,cloudtrail"),
-        );
+    // ── Route question → connect only relevant MCP servers ───────────────────
+    if (this.mcpService) {
+      const routing = routeQuestion(question);
+      if (routing.mcpServers.length > 0) {
+        const sp = new Spinner().start(`Connecting MCP: ${routing.mcpServers.join(", ")}…`);
+        const ok = await this.mcpService.connectForServices(routing.mcpServers);
+        if (ok) {
+          const servers = this.mcpService.getConnectedServers();
+          const count   = this.mcpService.getDiscoveredTools().length;
+          sp.succeed(`AWS MCP  ${c.dim("·")}  ${c.bold(servers.join(", "))}  ${c.dim(`·  ${count} tools`)}`);
+        } else {
+          sp.fail(c.dim(`MCP connect failed for [${routing.mcpServers.join(", ")}] — using SDK tools only`));
+        }
+        console.log("");
       }
-      console.log("");
     }
 
     // ── Preflight: validate AWS, k8s, MCP connectivity ───────────────────────
@@ -524,7 +540,8 @@ export class DiagnoseAgent {
           `\n  ${c.bold(c.green(sym.check))} ${c.dim(`[${stepNum}]`)} ${c.bold("conclusion")}  ` +
           `${c.dim(parsed.thought.slice(0, 80))}\n`,
         );
-        finalAnswer = (parsed as { done: true; answer: string }).answer;
+        const raw_answer = (parsed as { done: true; answer: unknown }).answer;
+        finalAnswer = typeof raw_answer === "string" ? raw_answer : JSON.stringify(raw_answer, null, 2);
         break;
       }
 
@@ -597,9 +614,12 @@ export class DiagnoseAgent {
           "If uncertain, rank your top 2 hypotheses by likelihood.";
         const raw2 = await this.bedrock.complete(forcePrompt, { maxTokens: CONCLUSION_MAX_TOKENS });
         const p2 = parseJsonPayload(raw2, "force-conclusion") as LLMResponse;
-        finalAnswer = p2.done
-          ? (p2 as { done: true; answer: string }).answer
-          : buildFallbackAnswer(steps);
+        if (p2.done) {
+          const raw_answer2 = (p2 as { done: true; answer: unknown }).answer;
+          finalAnswer = typeof raw_answer2 === "string" ? raw_answer2 : JSON.stringify(raw_answer2, null, 2);
+        } else {
+          finalAnswer = buildFallbackAnswer(steps);
+        }
         sp.succeed("Analysis complete");
       } catch {
         sp.fail("Summary failed — building fallback from evidence");

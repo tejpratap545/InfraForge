@@ -153,8 +153,20 @@ export function printSkipped(source: string, reason: string): void {
  * Renders the LLM markdown output into a styled terminal report.
  * Handles: ## headers, **bold**, - bullets, 1. lists, code blocks.
  */
-export function renderReport(text: string): string {
-  const lines = text.split("\n");
+export function renderReport(text: unknown): string {
+  // If LLM returned answer as a JSON object (e.g. {"## Root Cause": "..."}),
+  // flatten it into a markdown string instead of dumping raw JSON.
+  let safe: string;
+  if (typeof text === "string") {
+    safe = text;
+  } else if (text !== null && typeof text === "object" && !Array.isArray(text)) {
+    safe = Object.entries(text as Record<string, unknown>)
+      .map(([k, v]) => `${k}\n${typeof v === "string" ? v : JSON.stringify(v, null, 2)}`)
+      .join("\n\n");
+  } else {
+    safe = JSON.stringify(text, null, 2) ?? String(text);
+  }
+  const lines = safe.split("\n");
   const out: string[] = [""];
 
   let inCode = false;

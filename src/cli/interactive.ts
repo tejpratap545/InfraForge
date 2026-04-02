@@ -110,7 +110,10 @@ async function selectMenu(prompt: string, items: MenuItem[], canGoBack = false):
     for (const l of lines) process.stdout.write(l + "\n");
 
     readline.emitKeypressEvents(process.stdin);
-    if (process.stdin.isTTY) process.stdin.setRawMode(true);
+    if (process.stdin.isTTY) {
+      process.stdin.resume();
+      process.stdin.setRawMode(true);
+    }
 
     function redraw() {
       const newLines = renderMenuLines(prompt, items, selected);

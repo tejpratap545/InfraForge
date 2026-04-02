@@ -19,6 +19,7 @@ import { c, sym, Spinner, printBoxHeader, renderReport } from "../utils/terminal
 import type { AwsCredentials } from "../types";
 import type { AwsMcpService } from "../services/awsMcpService";
 import { runPreflight } from "../utils/preflight";
+import { routeQuestion } from "../utils/serviceRouter";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -126,21 +127,21 @@ export class AskAgent {
     printBoxHeader(`Asking · ${question.slice(0, 60)}`);
     console.log("");
 
-    // ── Connect MCP servers (non-blocking, same pattern as DiagnoseAgent) ──────
-    if (this.mcpService && !this.mcpService.isConnected()) {
-      const sp = new Spinner().start("Connecting to AWS MCP servers…");
-      const ok = await this.mcpService.connect();
-      if (ok) {
-        const servers = this.mcpService.getConnectedServers();
-        const count   = this.mcpService.getDiscoveredTools().length;
-        sp.succeed(
-          `AWS MCP  ${c.dim("·")}  ${c.bold(servers.join(", "))}  ` +
-          `${c.dim(`·  ${count} tool${count !== 1 ? "s" : ""} available`)}`,
-        );
-      } else {
-        sp.fail(c.dim("AWS MCP not connected — using SDK tools only"));
+    // ── Route question → connect only relevant MCP servers ───────────────────
+    if (this.mcpService) {
+      const routing = routeQuestion(question);
+      if (routing.mcpServers.length > 0) {
+        const sp = new Spinner().start(`Connecting MCP: ${routing.mcpServers.join(", ")}…`);
+        const ok = await this.mcpService.connectForServices(routing.mcpServers);
+        if (ok) {
+          const servers = this.mcpService.getConnectedServers();
+          const count   = this.mcpService.getDiscoveredTools().length;
+          sp.succeed(`AWS MCP  ${c.dim("·")}  ${c.bold(servers.join(", "))}  ${c.dim(`·  ${count} tools`)}`);
+        } else {
+          sp.fail(c.dim(`MCP connect failed for [${routing.mcpServers.join(", ")}] — using SDK tools only`));
+        }
+        console.log("");
       }
-      console.log("");
     }
 
     const mcpTools = this.mcpService?.isConnected() ? this.mcpService.getDiscoveredTools() : undefined;
@@ -183,7 +184,8 @@ export class AskAgent {
           `\n  ${c.bold(c.green(sym.check))} ${c.dim(`[${stepNum}]`)} ${c.bold("answer ready")}  ` +
           `${c.dim(parsed.thought.slice(0, 80))}\n`,
         );
-        finalAnswer = (parsed as { done: true; answer: string }).answer;
+        const raw_answer = (parsed as { done: true; answer: unknown }).answer;
+        finalAnswer = typeof raw_answer === "string" ? raw_answer : JSON.stringify(raw_answer, null, 2);
         break;
       }
 
@@ -230,9 +232,12 @@ export class AskAgent {
           "\n\nYou have reached the step limit. Answer now with done:true using all data gathered so far.";
         const raw2 = await this.bedrock.complete(forcePrompt, { maxTokens: ANSWER_MAX_TOKENS });
         const p2 = parseJsonPayload(raw2, "ask force-answer") as LLMResponse;
-        finalAnswer = p2.done
-          ? (p2 as { done: true; answer: string }).answer
-          : buildFallbackAnswer(steps);
+        if (p2.done) {
+          const raw_answer2 = (p2 as { done: true; answer: unknown }).answer;
+          finalAnswer = typeof raw_answer2 === "string" ? raw_answer2 : JSON.stringify(raw_answer2, null, 2);
+        } else {
+          finalAnswer = buildFallbackAnswer(steps);
+        }
         sp.succeed("Answer synthesised");
       } catch {
         sp.fail("Could not synthesise answer");
