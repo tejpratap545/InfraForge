@@ -33,25 +33,47 @@
  *
  * ── WELL-KNOWN SERVER NAMES ──────────────────────────────────────────────────
  *
- *   cloudwatch   → uvx awslabs.cloudwatch-mcp-server@latest
- *                  Tools: get_metric_data, analyze_metric, get_active_alarms,
- *                         get_alarm_history, execute_log_insights_query,
- *                         analyze_log_group, describe_log_groups
+ *  Observability:
+ *   cloudwatch   → CloudWatch metrics, Logs Insights, alarms, anomaly detection
+ *   cloudtrail   → API audit trail, recent deploys & config changes
+ *   prometheus   → Amazon Managed Prometheus (PromQL queries)
+ *   appsignals   → CloudWatch Application Signals, service health & SLOs
  *
- *   cloudtrail   → uvx awslabs.cloudtrail-mcp-server@latest
- *                  Tools: lookup_events, lake_query (recent API calls, deploys)
+ *  Containers & compute:
+ *   ecs          → ECS clusters/services/tasks (set ALLOW_SENSITIVE_DATA=true for logs)
+ *   eks          → EKS/Kubernetes pods, events, logs, insights
+ *   lambda       → Invoke Lambda functions as tools
+ *   serverless   → SAM CLI, Lambda deployments, CloudWatch logs
  *
- *   ecs          → uvx --from awslabs-ecs-mcp-server ecs-mcp-server
- *                  Tools: ECS service/task describe & management
+ *  Databases:
+ *   postgres / aurora  → Aurora/RDS PostgreSQL via RDS Data API
+ *   mysql              → Aurora/RDS MySQL via RDS Data API
+ *   dynamodb           → DynamoDB schema & cost analysis
+ *   documentdb         → DocumentDB collections & aggregations
+ *   redshift           → Redshift schema + read-only SQL
  *
- *   eks          → uvx awslabs.eks-mcp-server@latest
- *                  Tools: Kubernetes cluster management
+ *  Caching:
+ *   elasticache / redis  → ElastiCache cluster describe + CloudWatch metrics
+ *   valkey               → Valkey/Redis direct connection (needs VALKEY_HOST etc.)
+ *   memcached            → Memcached direct connection (needs MEMCACHED_HOST etc.)
  *
- *   iac          → uvx awslabs.aws-iac-mcp-server@latest
- *                  Tools: CloudFormation validation, deployment failure analysis
+ *  Messaging & streaming:
+ *   sns / sqs      → SNS topics, SQS queues, send/receive
+ *   stepfunctions / sfn  → Invoke Step Functions state machines
+ *   msk / kafka    → MSK (Kafka) cluster config & monitoring
+ *   mq             → Amazon MQ (RabbitMQ, ActiveMQ)
  *
- *   iam          → uvx awslabs.iam-mcp-server@latest
- *                  Tools: IAM role/policy inspection, permission simulation
+ *  Networking:
+ *   network / vpc  → VPC, Transit Gateway, Firewall path tracing, flow logs
+ *
+ *  Security:
+ *   iam            → IAM roles/policies, permission simulation
+ *
+ *  Infrastructure as code:
+ *   iac            → CloudFormation/CDK validation, deployment failure analysis
+ *
+ *  Cost:
+ *   cost           → Cost Explorer usage, comparisons, forecasts
  *
  * ─────────────────────────────────────────────────────────────────────────────
  */
@@ -140,32 +162,162 @@ interface ServerSlot {
   tools: AwsMcpTool[];
 }
 
-// ─── Well-known server defaults ───────────────────────────────────────────────
+// ─── Well-known server catalog ────────────────────────────────────────────────
+//
+// Each entry maps a short alias to the uvx command and a one-line description.
+// Aliases are case-insensitive and are matched after lower-casing.
+//
+// Notes:
+//  • Servers marked [AWS creds] only need AWS_PROFILE + AWS_REGION.
+//  • Servers marked [direct conn] also need endpoint env vars (see description).
+//  • ECS needs ALLOW_SENSITIVE_DATA=true to access task logs.
+//  • EKS needs --allow-write --allow-sensitive-data-access for full debugging.
+//  • MSK, network, prometheus need the underlying service to exist.
 
 const KNOWN_SERVERS: Record<string, { command: string; description: string }> = {
+
+  // ── Observability ──────────────────────────────────────────────────────────
   cloudwatch: {
     command: "uvx awslabs.cloudwatch-mcp-server@latest",
-    description: "CloudWatch metrics, logs Insights, alarms — core SRE observability",
+    description: "[AWS creds] Metrics, Logs Insights, alarms, anomaly detection",
   },
   cloudtrail: {
     command: "uvx awslabs.cloudtrail-mcp-server@latest",
-    description: "API audit trail — find recent deployments and config changes",
+    description: "[AWS creds] API audit trail — find deploys, config changes (90-day history)",
   },
+  prometheus: {
+    command: "uvx awslabs.prometheus-mcp-server@latest",
+    description: "[AWS creds] Amazon Managed Prometheus — PromQL instant + range queries",
+  },
+  appsignals: {
+    command: "uvx awslabs.cloudwatch-applicationsignals-mcp-server@latest",
+    description: "[AWS creds] CloudWatch Application Signals — service health & SLOs",
+  },
+
+  // ── Containers & compute ───────────────────────────────────────────────────
   ecs: {
-    command: "uvx --from awslabs-ecs-mcp-server ecs-mcp-server",
-    description: "ECS service/task describe, container health",
+    command: "uvx awslabs.ecs-mcp-server@latest",
+    description: "[AWS creds] ECS clusters/services/tasks/logs (set ALLOW_SENSITIVE_DATA=true for logs)",
   },
   eks: {
-    command: "uvx awslabs.eks-mcp-server@latest",
-    description: "EKS / Kubernetes cluster management",
+    command: "uvx awslabs.eks-mcp-server@latest --allow-write --allow-sensitive-data-access",
+    description: "[AWS creds] EKS clusters — pods, events, logs, IAM, insights",
   },
-  iac: {
-    command: "uvx awslabs.aws-iac-mcp-server@latest",
-    description: "CloudFormation validation and deployment failure analysis",
+  lambda: {
+    command: "uvx awslabs.lambda-tool-mcp-server@latest",
+    description: "[AWS creds] Invoke Lambda functions as tools; filter by FUNCTION_PREFIX or FUNCTION_LIST",
   },
+  serverless: {
+    command: "uvx awslabs.aws-serverless-mcp-server@latest",
+    description: "[AWS creds] SAM CLI, Lambda deployments, CloudWatch logs/metrics for serverless apps",
+  },
+
+  // ── Databases ─────────────────────────────────────────────────────────────
+  postgres: {
+    command: "uvx awslabs.postgres-mcp-server@latest",
+    description: "[AWS creds] Aurora/RDS PostgreSQL — natural-language queries via RDS Data API",
+  },
+  // Alias
+  aurora: {
+    command: "uvx awslabs.postgres-mcp-server@latest",
+    description: "[AWS creds] Aurora/RDS PostgreSQL — alias for 'postgres'",
+  },
+  mysql: {
+    command: "uvx awslabs.mysql-mcp-server@latest",
+    description: "[AWS creds] Aurora/RDS MySQL — read-only queries via RDS Data API",
+  },
+  dynamodb: {
+    command: "uvx awslabs.dynamodb-mcp-server@latest",
+    description: "[AWS creds] DynamoDB schema design, modeling, cost estimation",
+  },
+  documentdb: {
+    command: "uvx awslabs.documentdb-mcp-server@latest",
+    description: "[AWS creds] DocumentDB — list databases, collections, documents, aggregations",
+  },
+  redshift: {
+    command: "uvx awslabs.redshift-mcp-server@latest",
+    description: "[AWS creds] Redshift clusters/serverless — list schema, execute read-only SQL",
+  },
+
+  // ── Caching ────────────────────────────────────────────────────────────────
+  elasticache: {
+    command: "uvx awslabs.elasticache-mcp-server@latest",
+    description: "[AWS creds] ElastiCache — describe replication groups, clusters, CloudWatch metrics",
+  },
+  // Alias
+  redis: {
+    command: "uvx awslabs.elasticache-mcp-server@latest",
+    description: "[AWS creds] ElastiCache (Redis) — alias for 'elasticache'",
+  },
+  valkey: {
+    command: "uvx awslabs.valkey-mcp-server@latest",
+    description: "[direct conn] Valkey/Redis direct: set VALKEY_HOST, VALKEY_PORT, VALKEY_PWD",
+  },
+  memcached: {
+    command: "uvx awslabs.memcached-mcp-server@latest",
+    description: "[direct conn] Memcached direct: set MEMCACHED_HOST, MEMCACHED_PORT",
+  },
+
+  // ── Messaging & streaming ──────────────────────────────────────────────────
+  sns: {
+    command: "uvx awslabs.amazon-sns-sqs-mcp-server@latest",
+    description: "[AWS creds] SNS/SQS — topics, queues, send/receive messages",
+  },
+  // Alias
+  sqs: {
+    command: "uvx awslabs.amazon-sns-sqs-mcp-server@latest",
+    description: "[AWS creds] SNS/SQS — alias for 'sns'",
+  },
+  stepfunctions: {
+    command: "uvx awslabs.stepfunctions-tool-mcp-server@latest",
+    description: "[AWS creds] Invoke Step Functions state machines; filter by STATE_MACHINE_PREFIX",
+  },
+  // Alias
+  sfn: {
+    command: "uvx awslabs.stepfunctions-tool-mcp-server@latest",
+    description: "[AWS creds] Step Functions — alias for 'stepfunctions'",
+  },
+  msk: {
+    command: "uvx awslabs.aws-msk-mcp-server@latest",
+    description: "[AWS creds] MSK (Kafka) — cluster config, VPC connections, security, monitoring",
+  },
+  // Alias
+  kafka: {
+    command: "uvx awslabs.aws-msk-mcp-server@latest",
+    description: "[AWS creds] MSK (Kafka) — alias for 'msk'",
+  },
+  mq: {
+    command: "uvx awslabs.amazon-mq-mcp-server@latest",
+    description: "[AWS creds] Amazon MQ — RabbitMQ and ActiveMQ broker management",
+  },
+
+  // ── Networking ────────────────────────────────────────────────────────────
+  network: {
+    command: "uvx awslabs.aws-network-mcp-server@latest",
+    description: "[AWS creds] VPC, Transit Gateway, Firewall path tracing, flow log queries",
+  },
+  // Alias
+  vpc: {
+    command: "uvx awslabs.aws-network-mcp-server@latest",
+    description: "[AWS creds] VPC networking — alias for 'network'",
+  },
+
+  // ── Security & IAM ────────────────────────────────────────────────────────
   iam: {
     command: "uvx awslabs.iam-mcp-server@latest",
-    description: "IAM role/policy inspection and permission simulation",
+    description: "[AWS creds] IAM users/roles/policies, permission simulation (read-only by default)",
+  },
+
+  // ── Infrastructure as code ────────────────────────────────────────────────
+  iac: {
+    command: "uvx awslabs.aws-iac-mcp-server@latest",
+    description: "[AWS creds] CloudFormation/CDK validation, deployment failure analysis (30+ patterns)",
+  },
+
+  // ── Cost ─────────────────────────────────────────────────────────────────
+  cost: {
+    command: "uvx awslabs.cost-explorer-mcp-server@latest",
+    description: "[AWS creds] Cost Explorer — usage, comparisons, forecasts ($0.01/call)",
   },
 };
 
@@ -430,15 +582,22 @@ function extractParamNames(schema: Record<string, unknown> | undefined): string[
 }
 
 function buildNotConnectedError(): string {
-  const serverList = Object.keys(KNOWN_SERVERS).join(", ");
   return (
     `ERROR: AWS MCP server not connected.\n` +
-    `Quick start — add to your environment:\n` +
-    `  AWS_MCP_SERVERS=cloudwatch,cloudtrail   (well-known: ${serverList})\n` +
+    `Set AWS_MCP_SERVERS to a comma-separated list of server names, e.g.:\n\n` +
+    `  # Full SRE debugging stack\n` +
+    `  AWS_MCP_SERVERS=cloudwatch,cloudtrail,network,ecs,elasticache\n` +
     `  AWS_PROFILE=<your-aws-profile>\n` +
     `  AWS_REGION=<region>\n\n` +
-    `Or single server:\n` +
-    `  AWS_MCP_URL=http://localhost:8091/mcp\n` +
-    `  AWS_MCP_TRANSPORT=stdio  AWS_MCP_COMMAND="uvx awslabs.cloudwatch-mcp-server@latest"`
+    `Available server names:\n` +
+    `  Observability : cloudwatch, cloudtrail, prometheus, appsignals\n` +
+    `  Compute       : ecs, eks, lambda, serverless\n` +
+    `  Databases     : postgres, mysql, dynamodb, documentdb, redshift\n` +
+    `  Caching       : elasticache (redis), valkey, memcached\n` +
+    `  Messaging     : sns, sqs, stepfunctions, msk (kafka), mq\n` +
+    `  Networking    : network (vpc)\n` +
+    `  Security      : iam\n` +
+    `  IaC           : iac\n` +
+    `  Cost          : cost`
   );
 }
