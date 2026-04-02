@@ -16,6 +16,7 @@ import { BedrockService } from "../services/bedrockService";
 import { executeTool, buildToolCatalog, ToolContext } from "../services/diagnoseTools";
 import { parseJsonPayload } from "../utils/llm";
 import { c, sym, Spinner, printBoxHeader, renderReport } from "../utils/terminal";
+import type { AwsCredentials } from "../types";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -103,12 +104,12 @@ Your next action:`;
 export class AskAgent {
   constructor(private readonly bedrock: BedrockService) {}
 
-  async run(question: string, awsRegion: string, k8sContext?: string): Promise<string> {
+  async run(question: string, awsRegion: string, k8sContext?: string, credentials?: AwsCredentials): Promise<string> {
     console.log("");
     printBoxHeader(`Asking · ${question.slice(0, 60)}`);
     console.log("");
 
-    const ctx: ToolContext = { awsRegion, k8sContext };
+    const ctx: ToolContext = { awsRegion, k8sContext, awsCredentials: credentials };
     const steps: Step[] = [];
     let finalAnswer = "";
     let stepNum = 0;

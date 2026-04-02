@@ -5,6 +5,7 @@ import {
 } from "@aws-sdk/client-bedrock-runtime";
 import { createLogger } from "../utils/logging";
 import { TelemetryCollector } from "./telemetryCollector";
+import type { AwsCredentials } from "../types";
 
 const DEFAULT_MAX_TOKENS = 4096;
 const MAX_RETRIES = 3;
@@ -28,8 +29,12 @@ export class BedrockService {
     region: string,
     modelId = process.env.BEDROCK_MODEL_ID?.trim() || DEFAULT_MODEL_ID,
     telemetry?: TelemetryCollector,
+    credentials?: AwsCredentials,
   ) {
-    this.client = new BedrockRuntimeClient({ region });
+    this.client = new BedrockRuntimeClient({
+      region,
+      ...(credentials && { credentials }),
+    });
     this.region = region;
     this.modelId = modelId;
     this.telemetry = telemetry;

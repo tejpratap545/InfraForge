@@ -29,8 +29,13 @@ function requiredEnv(name: string, fallback?: string): string {
   return value;
 }
 
-function makeWorkflow(region: string, modelId?: string, telemetry?: TelemetryCollector): InfraWorkflow {
-  const bedrock = new BedrockService(region, modelId, telemetry);
+function makeWorkflow(
+  region: string,
+  modelId?: string,
+  telemetry?: TelemetryCollector,
+  bedrockCredentials?: { accessKeyId: string; secretAccessKey: string },
+): InfraWorkflow {
+  const bedrock = new BedrockService(region, modelId, telemetry, bedrockCredentials);
   const clarifyAgent = new ClarifyAgent(bedrock);
   const plannerAgent = new PlannerAgent(bedrock);
   const awsPlannerAgent = new AwsPlannerAgent(bedrock);
@@ -64,6 +69,12 @@ async function run(): Promise<void> {
     .option("--user-id <userId>", "user identifier", process.env.USER_ID)
     .option("--subscription <tier>", "free|pro|enterprise", process.env.SUBSCRIPTION_TIER ?? "pro")
     .option("--region <awsRegion>", "AWS region", process.env.AWS_REGION ?? "us-east-1")
+    // Bedrock credentials — for all LLM calls (the account where Bedrock models are deployed)
+    .option("--bedrock-access-key-id <keyId>", "Access key ID for the Bedrock AWS account", process.env.BEDROCK_ACCESS_KEY_ID)
+    .option("--bedrock-secret-access-key <secret>", "Secret access key for the Bedrock AWS account", process.env.BEDROCK_SECRET_ACCESS_KEY)
+    // Tenant credentials — for the account being investigated/managed (CloudWatch, CloudControl, etc.)
+    .option("--aws-access-key-id <keyId>", "Access key ID for the tenant AWS account", process.env.TENANT_AWS_ACCESS_KEY_ID)
+    .option("--aws-secret-access-key <secret>", "Secret access key for the tenant AWS account", process.env.TENANT_AWS_SECRET_ACCESS_KEY)
     .option("--log-level <level>", "debug|info|warn|error", getConfiguredLogLevel())
     .option("--tf-dir <path>", "path to existing Terraform directory (triggers update flow)")
     .option("-i, --input <instruction>", "plain-language change description (used with --tf-dir)")
@@ -71,24 +82,44 @@ async function run(): Promise<void> {
 
   const tenantService = new TenantService();
 
+  type GlobalOpts = {
+    tenantId?: string;
+    userId?: string;
+    subscription: "free" | "pro" | "enterprise";
+    region: string;
+    bedrockAccessKeyId?: string;
+    bedrockSecretAccessKey?: string;
+    awsAccessKeyId?: string;
+    awsSecretAccessKey?: string;
+    logLevel: "debug" | "info" | "warn" | "error";
+    tfDir?: string;
+    input?: string;
+    engine: "terraform" | "aws";
+  };
+
+  /** Tenant context — carries the investigated account's credentials. */
   const buildTenant = (): ReturnType<TenantService["buildContext"]> => {
-    const opts = program.opts<{
-      tenantId?: string;
-      userId?: string;
-      subscription: "free" | "pro" | "enterprise";
-      region: string;
-      logLevel: "debug" | "info" | "warn" | "error";
-      tfDir?: string;
-      input?: string;
-      engine: "terraform" | "aws";
-    }>();
+    const opts = program.opts<GlobalOpts>();
     process.env.LOG_LEVEL = opts.logLevel;
+    const awsCredentials =
+      opts.awsAccessKeyId && opts.awsSecretAccessKey
+        ? { accessKeyId: opts.awsAccessKeyId, secretAccessKey: opts.awsSecretAccessKey }
+        : undefined;
     return tenantService.buildContext({
       tenantId: requiredEnv("TENANT_ID", opts.tenantId),
       userId: requiredEnv("USER_ID", opts.userId),
       subscriptionTier: opts.subscription,
       awsRegion: opts.region,
+      awsCredentials,
     });
+  };
+
+  /** Bedrock credentials — for the account where LLMs are deployed. */
+  const bedrockCreds = (): { accessKeyId: string; secretAccessKey: string } | undefined => {
+    const opts = program.opts<GlobalOpts>();
+    return opts.bedrockAccessKeyId && opts.bedrockSecretAccessKey
+      ? { accessKeyId: opts.bedrockAccessKeyId, secretAccessKey: opts.bedrockSecretAccessKey }
+      : undefined;
   };
 
   program
@@ -102,7 +133,7 @@ async function run(): Promise<void> {
         return;
       }
       const tenant = buildTenant();
-      const workflow = makeWorkflow(tenant.awsRegion);
+      const workflow = makeWorkflow(tenant.awsRegion, undefined, undefined, bedrockCreds());
       if (opts.engine === "aws") {
         await workflow.createWithAwsSdk(opts.input, tenant);
       } else {
@@ -121,7 +152,7 @@ async function run(): Promise<void> {
         return;
       }
       const tenant = buildTenant();
-      const workflow = makeWorkflow(tenant.awsRegion);
+      const workflow = makeWorkflow(tenant.awsRegion, undefined, undefined, bedrockCreds());
       await workflow.planOnly(opts.input, tenant);
     });
 
@@ -142,7 +173,7 @@ async function run(): Promise<void> {
         return;
       }
       const tenant = buildTenant();
-      const workflow = makeWorkflow(tenant.awsRegion);
+      const workflow = makeWorkflow(tenant.awsRegion, undefined, undefined, bedrockCreds());
       await workflow.updateExisting(opts.input, resolve(opts.tfDir), tenant);
     });
 
@@ -157,7 +188,7 @@ async function run(): Promise<void> {
         return;
       }
       const tenant = buildTenant();
-      const workflow = makeWorkflow(tenant.awsRegion);
+      const workflow = makeWorkflow(tenant.awsRegion, undefined, undefined, bedrockCreds());
       await workflow.applyExisting(opts.input, tenant);
     });
 
@@ -167,7 +198,7 @@ async function run(): Promise<void> {
     .requiredOption("-q, --question <question>", "question about your AWS account")
     .action(async (cmd) => {
       const tenant = buildTenant();
-      const workflow = makeWorkflow(tenant.awsRegion);
+      const workflow = makeWorkflow(tenant.awsRegion, undefined, undefined, bedrockCreds());
       await workflow.ask(cmd.question, tenant);
     });
 
@@ -187,7 +218,7 @@ async function run(): Promise<void> {
     .option("--k8s-context <context>", "kubectl context name (default: current context)")
     .action(async (cmd) => {
       const tenant = buildTenant();
-      const workflow = makeWorkflow(tenant.awsRegion);
+      const workflow = makeWorkflow(tenant.awsRegion, undefined, undefined, bedrockCreds());
       await workflow.debug(cmd.service, tenant, {
         namespace: cmd.namespace,
         since: cmd.since,
@@ -209,7 +240,7 @@ async function run(): Promise<void> {
     .option("--k8s-context <context>", "kubectl context name (default: current context)")
     .action(async (cmd) => {
       const tenant = buildTenant();
-      const workflow = makeWorkflow(tenant.awsRegion);
+      const workflow = makeWorkflow(tenant.awsRegion, undefined, undefined, bedrockCreds());
       await workflow.diagnose(cmd.question, tenant, cmd.k8sContext);
     });
 
@@ -225,11 +256,11 @@ async function run(): Promise<void> {
         process.exitCode = 1;
         return;
       }
-      const workflow = makeWorkflow(tenant.awsRegion);
+      const workflow = makeWorkflow(tenant.awsRegion, undefined, undefined, bedrockCreds());
       await workflow.updateExisting(instruction, resolve(opts.tfDir), tenant);
       return;
     }
-    await runInteractiveSession(tenant, (region, modelId, telemetry) => makeWorkflow(region, modelId, telemetry));
+    await runInteractiveSession(tenant, (region, modelId, telemetry) => makeWorkflow(region, modelId, telemetry, bedrockCreds()));
   });
 
   await program.parseAsync(process.argv);

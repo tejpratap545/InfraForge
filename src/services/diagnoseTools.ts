@@ -29,12 +29,15 @@ import {
   FilterLogEventsCommand,
   DescribeLogGroupsCommand,
 } from "@aws-sdk/client-cloudwatch-logs";
+import type { AwsCredentials } from "../types";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export interface ToolContext {
   awsRegion: string;
   k8sContext?: string;
+  /** Explicit AWS credentials. Falls back to SDK default chain if omitted. */
+  awsCredentials?: AwsCredentials;
 }
 
 // ─── Safety blocklist for run_command ────────────────────────────────────────
@@ -126,7 +129,7 @@ export async function aws_query(
   // Optional ResourceModel filter — JSON string scoping the list (e.g. '{"VpcId":"vpc-0abc"}')
   const filter      = params["filter"]?.trim() || undefined;
 
-  const client = new CloudControlClient({ region: r });
+  const client = new CloudControlClient({ region: r, ...(ctx.awsCredentials && { credentials: ctx.awsCredentials }) });
 
   try {
     const res = await client.send(
@@ -185,7 +188,7 @@ export async function aws_get(
   }
 
   const r = params["region"]?.trim() || ctx.awsRegion;
-  const client = new CloudControlClient({ region: r });
+  const client = new CloudControlClient({ region: r, ...(ctx.awsCredentials && { credentials: ctx.awsCredentials }) });
 
   try {
     const res = await client.send(
@@ -250,7 +253,7 @@ export async function cw_metrics(
   const StartTime = new Date(EndTime.getTime() - sinceHours * 3_600_000);
 
   try {
-    const client = new CloudWatchClient({ region: r });
+    const client = new CloudWatchClient({ region: r, ...(ctx.awsCredentials && { credentials: ctx.awsCredentials }) });
     const res = await client.send(new GetMetricStatisticsCommand({
       Namespace:  namespace,
       MetricName: metric,
@@ -307,7 +310,7 @@ export async function cw_logs(
 
   if (!logGroupParam) return "ERROR: log_group param required";
 
-  const client    = new CloudWatchLogsClient({ region: r });
+  const client    = new CloudWatchLogsClient({ region: r, ...(ctx.awsCredentials && { credentials: ctx.awsCredentials }) });
   const startTime = Date.now() - Math.round(sinceHours * 3_600_000);
 
   // Resolve log group — try exact name first, then prefix search.

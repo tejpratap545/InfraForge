@@ -6,7 +6,7 @@ import {
   GetResourceRequestStatusCommand,
   OperationStatus,
 } from "@aws-sdk/client-cloudcontrol";
-import { CloudControlCall } from "../types";
+import { CloudControlCall, AwsCredentials } from "../types";
 import { createLogger } from "../utils/logging";
 
 const log = createLogger({ component: "aws-executor" });
@@ -36,8 +36,11 @@ export interface AwsCallResult {
 export class AwsExecutorService {
   private readonly client: CloudControlClient;
 
-  constructor(region: string) {
-    this.client = new CloudControlClient({ region });
+  constructor(region: string, credentials?: AwsCredentials) {
+    this.client = new CloudControlClient({
+      region,
+      ...(credentials && { credentials }),
+    });
   }
 
   async execute(calls: CloudControlCall[]): Promise<AwsCallResult[]> {

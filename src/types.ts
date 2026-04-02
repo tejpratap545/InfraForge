@@ -5,11 +5,18 @@ export type AwsInventoryServiceName = string;
 // Keep this open so intent parsing can support the full AWS Terraform provider surface.
 export type InfraResourceType = string;
 
+export interface AwsCredentials {
+  accessKeyId: string;
+  secretAccessKey: string;
+}
+
 export interface TenantContext {
   tenantId: string;
   subscriptionTier: "free" | "pro" | "enterprise";
   userId: string;
   awsRegion: string;
+  /** Explicit AWS credentials for this account. Falls back to SDK default chain if omitted. */
+  awsCredentials?: AwsCredentials;
 }
 
 export interface Intent {

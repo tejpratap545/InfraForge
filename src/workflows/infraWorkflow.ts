@@ -241,7 +241,7 @@ export class InfraWorkflow {
 
     // Step 3 — execute calls sequentially
     console.log("");
-    const executor = new AwsExecutorService(tenant.awsRegion);
+    const executor = new AwsExecutorService(tenant.awsRegion, tenant.awsCredentials);
     let failCount = 0;
     for (const call of plan.calls) {
       const sp = new Spinner().start(`${c.cyan(call.typeName)}  ${c.bold(call.operation.toUpperCase())}`);
@@ -357,7 +357,7 @@ export class InfraWorkflow {
     this.tracing.log(trace, "Debug workflow start", { serviceName, tenantId: tenant.tenantId });
 
     const options: DebugOptions = { ...debugOptions, awsRegion: tenant.awsRegion };
-    const report = await this.diagnoseAgent.run(serviceName, tenant.awsRegion, options);
+    const report = await this.diagnoseAgent.run(serviceName, tenant.awsRegion, options, tenant.awsCredentials);
     if (report) console.log(report);
 
     this.tracing.log(trace, "Debug workflow completed", { latencyMs: Date.now() - startedAt, serviceName });
@@ -375,7 +375,7 @@ export class InfraWorkflow {
     printKV("Question", c.bold(question), { keyWidth: 10 });
     console.log("");
 
-    const report = await this.diagnoseAgent.run(question, tenant.awsRegion, { k8sContext });
+    const report = await this.diagnoseAgent.run(question, tenant.awsRegion, { k8sContext }, tenant.awsCredentials);
     if (report) console.log(report);
 
     this.tracing.log(trace, "Diagnose workflow completed", { latencyMs: Date.now() - startedAt });
@@ -389,7 +389,7 @@ export class InfraWorkflow {
     this.rateLimiter.assertWithinLimit(tenant, this.subscription.getLimits(tenant).commandsPerMinute);
     this.tracing.log(trace, "Ask workflow start", { question, tenantId: tenant.tenantId });
 
-    const answer = await this.askAgent.run(question, tenant.awsRegion);
+    const answer = await this.askAgent.run(question, tenant.awsRegion, undefined, tenant.awsCredentials);
     if (answer) console.log(answer);
 
     this.tracing.log(trace, "Ask workflow completed", { latencyMs: Date.now() - startedAt, question });
