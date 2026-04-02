@@ -1,15 +1,33 @@
 /**
  * diagnoseTools.ts
  *
- * Four generic primitives — the LLM generates all parameters dynamically.
- * No pre-defined cases. Works like Claude Code / Codex:
+ * Comprehensive SRE diagnostic toolkit — the LLM generates all parameters dynamically.
  *
- *   run_command   — any read-only shell command (kubectl, aws CLI, ssh, dig, nc …)
+ * Core tools:
+ *   run_command   — any read-only shell command (kubectl, helm, dig, nc …)
  *   aws_query     — Cloud Control ListResources for any AWS::* type
  *   aws_get       — Cloud Control GetResource for a specific resource
- *   ec2_exec      — run a command ON an EC2 instance via AWS SSM (no SSH key needed)
+ *   ec2_exec      — run a command ON an EC2 instance via AWS SSM SDK (no SSH/CLI needed)
  *
- * The LLM decides WHAT to run at each step based on accumulated evidence.
+ * AWS observability:
+ *   cw_metrics    — CloudWatch metric statistics (CPU, latency, errors, connections …)
+ *   cw_logs       — CloudWatch Logs search
+ *   pi_top_sql    — Performance Insights top SQL by DB load
+ *
+ * AWS infrastructure:
+ *   ecs_describe  — ECS services, tasks, deployments, container status
+ *   elb_health    — ALB/NLB target group health checks
+ *   cloudtrail    — recent API events / deployments / config changes
+ *   asg_activity  — Auto Scaling group scaling events
+ *   route53_check — DNS record lookup via Route 53
+ *
+ * K8s tools:
+ *   k8s_pods      — structured pod status (restarts, OOM, CrashLoop detection)
+ *   k8s_events    — recent cluster events with severity filtering
+ *   k8s_logs      — pod/container log search with filtering
+ *
+ * MCP:
+ *   mcp_tool      — route to any connected AWS MCP server tool
  */
 
 import { exec } from "node:child_process";
@@ -22,7 +40,6 @@ import {
 import {
   CloudWatchClient,
   GetMetricStatisticsCommand,
-  StandardUnit,
   Statistic,
 } from "@aws-sdk/client-cloudwatch";
 import {
@@ -30,6 +47,49 @@ import {
   FilterLogEventsCommand,
   DescribeLogGroupsCommand,
 } from "@aws-sdk/client-cloudwatch-logs";
+import {
+  PIClient,
+  DescribeDimensionKeysCommand,
+} from "@aws-sdk/client-pi";
+import {
+  RDSClient,
+  DescribeDBInstancesCommand,
+} from "@aws-sdk/client-rds";
+import {
+  ECSClient,
+  DescribeServicesCommand,
+  DescribeClustersCommand,
+  ListServicesCommand,
+  ListTasksCommand,
+  DescribeTasksCommand,
+  ListClustersCommand,
+} from "@aws-sdk/client-ecs";
+import {
+  ElasticLoadBalancingV2Client,
+  DescribeTargetHealthCommand,
+  DescribeTargetGroupsCommand,
+  DescribeLoadBalancersCommand,
+} from "@aws-sdk/client-elastic-load-balancing-v2";
+import {
+  CloudTrailClient,
+  LookupEventsCommand,
+  type LookupAttribute,
+} from "@aws-sdk/client-cloudtrail";
+import {
+  AutoScalingClient,
+  DescribeScalingActivitiesCommand,
+  DescribeAutoScalingGroupsCommand,
+} from "@aws-sdk/client-auto-scaling";
+import {
+  SSMClient,
+  SendCommandCommand,
+  GetCommandInvocationCommand,
+} from "@aws-sdk/client-ssm";
+import {
+  Route53Client,
+  ListResourceRecordSetsCommand,
+  ListHostedZonesCommand,
+} from "@aws-sdk/client-route-53";
 import type { AwsCredentials } from "../types";
 import type { AwsMcpService, AwsMcpTool } from "./awsMcpService";
 
@@ -44,6 +104,16 @@ export interface ToolContext {
   mcpService?: AwsMcpService;
 }
 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/** Build AWS SDK client config from context. */
+function awsConfig(ctx: ToolContext, regionOverride?: string) {
+  return {
+    region: regionOverride?.trim() || ctx.awsRegion,
+    ...(ctx.awsCredentials && { credentials: ctx.awsCredentials }),
+  };
+}
+
 // ─── Safety blocklist for run_command ────────────────────────────────────────
 // Only blocks destructive operations. All read/diagnostic commands pass.
 
@@ -51,9 +121,12 @@ const BLOCKED: RegExp[] = [
   /\brm\s+-[rf]/i,
   /\bformat\b/i,
   /\bfdisk\b/i,
-  /^\s*aws\s+/i,           // AWS CLI — use aws_query / aws_get / ec2_exec / cw_metrics / cw_logs instead
+  /^\s*aws\s+/i,           // AWS CLI — use SDK tools instead
   /kubectl\s+delete\b/i,
   /kubectl\s+apply\b/i,
+  /kubectl\s+patch\b/i,
+  /kubectl\s+edit\b/i,
+  /kubectl\s+scale\b/i,
   /\|\s*(sh|bash|zsh)\b/,
   /curl\s+.*\|\s*(sh|bash)/i,
   /\bdd\s+if=/i,
@@ -70,19 +143,13 @@ function shell(cmd: string, timeoutMs = 30_000): Promise<string> {
   return new Promise((resolve) => {
     exec(cmd, { timeout: timeoutMs }, (_err, stdout, stderr) => {
       const combined = [stdout, stderr].filter(Boolean).join("\n").trim();
-      // Always resolve — errors are part of the output the LLM reasons about.
-      resolve(combined.slice(0, 3_000) || "(no output)");
+      resolve(combined.slice(0, 8_000) || "(no output)");
     });
   });
 }
 
 // ─── Tool 1: run_command ──────────────────────────────────────────────────────
 
-/**
- * Execute any read-only shell command.
- * LLM generates the exact command string — kubectl, nslookup, dig, curl -I,
- * aws CLI, ping, nc, openssl s_client, etc.
- */
 export async function run_command(
   params: Record<string, string>,
   ctx: ToolContext,
@@ -91,7 +158,7 @@ export async function run_command(
   if (!cmd) return "ERROR: command param is required";
   if (!isSafe(cmd)) {
     if (/^\s*aws\s+/i.test(cmd)) {
-      return `BLOCKED: use SDK tools instead of AWS CLI — aws_query(type) to list, aws_get(type,id) to inspect, ec2_exec(id,cmd) to run inside EC2, cw_metrics/cw_logs for observability.`;
+      return `BLOCKED: use SDK tools instead of AWS CLI — aws_query, aws_get, ecs_describe, elb_health, cloudtrail, cw_metrics, cw_logs, etc.`;
     }
     return `BLOCKED: command matches safety blocklist — "${cmd}"`;
   }
@@ -109,18 +176,6 @@ export async function run_command(
 
 // ─── Tool 2: aws_query ────────────────────────────────────────────────────────
 
-/**
- * List AWS resources of any CloudFormation type via Cloud Control API.
- * No AWS CLI required — uses the installed @aws-sdk/client-cloudcontrol.
- *
- * Examples:
- *   type=AWS::ElasticLoadBalancingV2::LoadBalancer
- *   type=AWS::EC2::SecurityGroup
- *   type=AWS::Route53::HostedZone
- *   type=AWS::CertificateManager::Certificate
- *   type=AWS::EKS::Cluster
- *   type=AWS::RDS::DBInstance
- */
 export async function aws_query(
   params: Record<string, string>,
   ctx: ToolContext,
@@ -130,9 +185,6 @@ export async function aws_query(
 
   const r          = params["region"]?.trim() || ctx.awsRegion;
   const maxResults  = Math.min(parseInt(params["max_results"] ?? "20", 10), 50);
-  // Optional ResourceModel filter — JSON string scoping the list (e.g. '{"VpcId":"vpc-0abc"}')
-  // LLM may pass filter as an object, a valid JSON string, or a "Key=Value" string.
-  // AWS Cloud Control requires a valid JSON object string — normalise all forms.
   const rawFilter = params["filter"];
   let filter: string | undefined;
   if (rawFilter == null || rawFilter === "") {
@@ -144,10 +196,8 @@ export async function aws_query(
     if (!s) {
       filter = undefined;
     } else if (s.startsWith("{")) {
-      // Already a JSON object string — validate it, drop if malformed
       try { JSON.parse(s); filter = s; } catch { filter = undefined; }
     } else if (s.includes("=")) {
-      // "Key=Value,Key2=Value2" → {"Key":"Value","Key2":"Value2"}
       const obj: Record<string, string> = {};
       s.split(",").forEach((kv) => {
         const eq = kv.indexOf("=");
@@ -159,14 +209,10 @@ export async function aws_query(
     }
   }
 
-  // Optional: client-side substring filter applied to identifier + properties JSON.
-  // When set, auto-paginates all pages (up to 10) to find matching items.
   const nameFilter = params["name_filter"]?.trim().toLowerCase() || undefined;
-
-  // Optional: resume token from a previous aws_query call (for manual pagination).
   const nextTokenIn = params["next_token"]?.trim() || undefined;
 
-  const client = new CloudControlClient({ region: r, ...(ctx.awsCredentials && { credentials: ctx.awsCredentials }) });
+  const client = new CloudControlClient(awsConfig(ctx, r));
 
   function formatItem(item: { Identifier?: string; Properties?: string }): string {
     const id = item.Identifier ?? "?";
@@ -176,16 +222,15 @@ export async function aws_query(
     } catch {
       props = item.Properties ?? "";
     }
-    return `${id}  ${props.slice(0, 400)}`;
+    return `${id}  ${props.slice(0, 600)}`;
   }
 
   try {
     if (nameFilter) {
-      // Auto-paginate up to 10 pages, collecting items that match the filter.
       const matched: string[] = [];
       let token: string | undefined;
       let pages = 0;
-      const pageSize = 50; // max per page to minimise round-trips
+      const pageSize = 50;
 
       while (pages < 10) {
         const res: ListResourcesCommandOutput = await client.send(
@@ -203,7 +248,7 @@ export async function aws_query(
 
         token = res.NextToken;
         if (!token) break;
-        if (matched.length >= maxResults) break; // enough results, stop early
+        if (matched.length >= maxResults) break;
       }
 
       if (matched.length === 0) {
@@ -212,7 +257,6 @@ export async function aws_query(
       return `${typeName} matching "${nameFilter}" in ${r} (${matched.length} found, scanned ${pages} page(s)):\n` + matched.join("\n");
     }
 
-    // Single-page list (with optional manual pagination token).
     const res = await client.send(
       new ListResourcesCommand({ TypeName: typeName, MaxResults: maxResults, ResourceModel: filter, NextToken: nextTokenIn }),
     );
@@ -236,14 +280,6 @@ export async function aws_query(
 
 // ─── Tool 3: aws_get ──────────────────────────────────────────────────────────
 
-/**
- * Get full properties of a specific AWS resource via Cloud Control.
- * The identifier comes from aws_query results.
- *
- * Examples:
- *   type=AWS::EC2::SecurityGroup  identifier=sg-0abc123def
- *   type=AWS::ElasticLoadBalancingV2::LoadBalancer  identifier=arn:aws:elasticloadbalancing:...
- */
 export async function aws_get(
   params: Record<string, string>,
   ctx: ToolContext,
@@ -252,13 +288,12 @@ export async function aws_get(
   const identifier = params["identifier"]?.trim();
   if (!typeName)   return "ERROR: type param is required";
   if (!identifier) return "ERROR: identifier param is required";
-  // Guard against the LLM passing a non-specific identifier like "all" or "*"
   if (/^(all|\*|list|any)$/i.test(identifier)) {
-    return `ERROR: "${identifier}" is not a valid identifier. Use aws_query first to list resources and get their IDs, then call aws_get with a specific ID (e.g. i-0abc123, sg-0abc123, arn:...).`;
+    return `ERROR: "${identifier}" is not a valid identifier. Use aws_query first to list resources and get their IDs, then call aws_get with a specific ID.`;
   }
 
   const r = params["region"]?.trim() || ctx.awsRegion;
-  const client = new CloudControlClient({ region: r, ...(ctx.awsCredentials && { credentials: ctx.awsCredentials }) });
+  const client = new CloudControlClient(awsConfig(ctx, r));
 
   try {
     const res = await client.send(
@@ -268,30 +303,25 @@ export async function aws_get(
     const props = res.ResourceDescription?.Properties;
     if (!props) return `No properties returned for ${typeName}/${identifier}`;
 
-    // Pretty-print so the LLM can read nested objects
     try {
-      return `${typeName}/${identifier}:\n${JSON.stringify(JSON.parse(props), null, 2).slice(0, 3_000)}`;
+      return `${typeName}/${identifier}:\n${JSON.stringify(JSON.parse(props), null, 2).slice(0, 6_000)}`;
     } catch {
-      return `${typeName}/${identifier}:\n${props.slice(0, 3_000)}`;
+      return `${typeName}/${identifier}:\n${props.slice(0, 6_000)}`;
     }
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.includes("not supported") || msg.includes("UnsupportedAction")) {
-      return `Cloud Control does not support ${typeName}. Try aws_query with a related CloudFormation type, or aws_get with a known identifier.`;
+      return `Cloud Control does not support ${typeName}. Try aws_query with a related CloudFormation type.`;
     }
     return `ERROR: ${msg}`;
   }
 }
 
-// ─── Tool 4: cw_metrics ───────────────────────────────────────────────────────
+// ─── Tool 4: cw_metrics ──────────────────────────────────────────────────────
 
 /**
- * Fetch CloudWatch metric statistics for any AWS resource.
- * Uses @aws-sdk/client-cloudwatch — no CLI needed.
- *
- * namespace  e.g. AWS/EC2, AWS/RDS, AWS/ECS, AWS/Lambda, AWS/ApplicationELB
- * metric     e.g. CPUUtilization, NetworkIn, DatabaseConnections, Errors
- * dimensions e.g. InstanceId=i-0abc123  or  FunctionName=my-fn,Resource=my-fn
+ * Fetch CloudWatch metric statistics. No hardcoded Unit — automatically works
+ * for all metric types (percentages, counts, bytes, milliseconds, etc.).
  */
 export async function cw_metrics(
   params: Record<string, string>,
@@ -299,10 +329,6 @@ export async function cw_metrics(
 ): Promise<string> {
   const namespace  = params["namespace"]?.trim();
   const metric     = params["metric"]?.trim();
-  // LLM may pass dimensions as:
-  //   "Key=Value"                          → plain string, use as-is
-  //   {"Key":"Value"}                      → flat object, entries → "Key=Value"
-  //   [{"Name":"Key","Value":"Value"},…]   → AWS SDK shape, map to "Key=Value"
   const rawDims = params["dimensions"];
   let dimensions: string | undefined;
   if (rawDims == null) {
@@ -336,7 +362,9 @@ export async function cw_metrics(
   const StartTime = new Date(EndTime.getTime() - sinceHours * 3_600_000);
 
   try {
-    const client = new CloudWatchClient({ region: r, ...(ctx.awsCredentials && { credentials: ctx.awsCredentials }) });
+    const client = new CloudWatchClient(awsConfig(ctx, r));
+    // NOTE: Do NOT pass Unit param — let CloudWatch return the metric's native unit.
+    // Passing Unit:Percent would filter out non-percentage metrics like counts, bytes, ms.
     const res = await client.send(new GetMetricStatisticsCommand({
       Namespace:  namespace,
       MetricName: metric,
@@ -345,15 +373,17 @@ export async function cw_metrics(
       EndTime,
       Period:     periodMin * 60,
       Statistics: [stat],
-      Unit:       StandardUnit.Percent,   // falls back gracefully if unit doesn't match
     }));
 
     const points = (res.Datapoints ?? [])
       .sort((a, b) => (a.Timestamp?.getTime() ?? 0) - (b.Timestamp?.getTime() ?? 0));
 
     if (points.length === 0) {
-      return `No datapoints for ${namespace}/${metric} (dims=${dimensions ?? "none"}) last ${sinceHours}h in ${r}`;
+      return `No datapoints for ${namespace}/${metric} (dims=${dimensions ?? "none"}) last ${sinceHours}h in ${r}. Check metric name, namespace, and dimensions are correct.`;
     }
+
+    // Detect unit from first datapoint
+    const unit = points[0]?.Unit ?? "None";
 
     const rows = points.map((p) => {
       const ts  = p.Timestamp?.toISOString().slice(11, 19) ?? "?";
@@ -364,10 +394,11 @@ export async function cw_metrics(
     const values = points.map((p) => (p[stat as keyof typeof p] as number | undefined) ?? 0);
     const avg = (values.reduce((a, b) => a + b, 0) / values.length).toFixed(2);
     const max = Math.max(...values).toFixed(2);
+    const min = Math.min(...values).toFixed(2);
 
     return [
-      `${namespace}/${metric}  dims=${dimensions ?? "none"}  last ${sinceHours}h  period=${periodMin}m  stat=${stat}`,
-      `avg=${avg}  max=${max}  points=${points.length}`,
+      `${namespace}/${metric}  dims=${dimensions ?? "none"}  last ${sinceHours}h  period=${periodMin}m  stat=${stat}  unit=${unit}`,
+      `avg=${avg}  max=${max}  min=${min}  points=${points.length}`,
       ...rows,
     ].join("\n");
   } catch (err: unknown) {
@@ -377,10 +408,6 @@ export async function cw_metrics(
 
 // ─── Tool 5: cw_logs ─────────────────────────────────────────────────────────
 
-/**
- * Search CloudWatch Logs using @aws-sdk/client-cloudwatch-logs — no CLI needed.
- * log_group can be a full name or a prefix (uses DescribeLogGroups to discover).
- */
 export async function cw_logs(
   params: Record<string, string>,
   ctx: ToolContext,
@@ -388,12 +415,12 @@ export async function cw_logs(
   const logGroupParam   = params["log_group"]?.trim();
   const filterPattern   = params["filter_pattern"]?.trim() ?? "";
   const sinceHours      = parseFloat(params["since_hours"] ?? "1");
-  const limit           = Math.min(parseInt(params["limit"] ?? "30", 10), 50);
+  const limit           = Math.min(parseInt(params["limit"] ?? "50", 10), 100);
   const r               = params["region"]?.trim() || ctx.awsRegion;
 
   if (!logGroupParam) return "ERROR: log_group param required";
 
-  const client    = new CloudWatchLogsClient({ region: r, ...(ctx.awsCredentials && { credentials: ctx.awsCredentials }) });
+  const client    = new CloudWatchLogsClient(awsConfig(ctx, r));
   const startTime = Date.now() - Math.round(sinceHours * 3_600_000);
 
   // Resolve log group — try exact name first, then prefix search.
@@ -425,7 +452,7 @@ export async function cw_logs(
       const ts  = e.timestamp ? new Date(e.timestamp).toISOString() : "?";
       const msg = (e.message ?? "").trim();
       const lvl = msg.match(/\b(ERROR|WARN|INFO|DEBUG|CRITICAL|FATAL)\b/i)?.[1]?.toUpperCase() ?? "";
-      return `${ts}${lvl ? "  " + lvl : ""}  ${msg}`;
+      return `${ts}${lvl ? "  " + lvl : ""}  ${msg.slice(0, 500)}`;
     });
 
     return [`log_group=${logGroupName}  filter="${filterPattern}"  last ${sinceHours}h  (${events.length} events)`, ...lines].join("\n");
@@ -434,15 +461,8 @@ export async function cw_logs(
   }
 }
 
-// ─── Tool 6: ec2_exec ─────────────────────────────────────────────────────────
+// ─── Tool 6: ec2_exec (SSM SDK — no AWS CLI needed) ─────────────────────────
 
-/**
- * Run a shell command ON an EC2 instance via AWS Systems Manager (SSM).
- * No SSH key, no open port 22 needed — instance just needs the SSM agent running.
- *
- * Use this when you need to inspect something from INSIDE the instance:
- *   netstat -tlnp, curl <internal-endpoint>, cat /var/log/app.log, df -h, etc.
- */
 export async function ec2_exec(
   params: Record<string, string>,
   ctx: ToolContext,
@@ -455,130 +475,663 @@ export async function ec2_exec(
   if (!command)    return "ERROR: command param is required";
   if (!isSafe(command)) return `BLOCKED: command matches safety blocklist — "${command}"`;
 
-  // Escape single-quotes inside the command so it's safe inside a JSON array string.
-  const escaped = command.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  const ssm = new SSMClient(awsConfig(ctx, r));
 
-  // Send the command via SSM.
-  const sendRaw = await shell(
-    `aws ssm send-command` +
-    ` --instance-ids "${instanceId}"` +
-    ` --document-name "AWS-RunShellScript"` +
-    ` --parameters '{"commands":["${escaped}"]}'` +
-    ` --region ${r}` +
-    ` --output json`,
-    15_000,
-  );
-
-  let commandId: string;
   try {
-    const data = JSON.parse(sendRaw) as { Command?: { CommandId?: string } };
-    commandId = data.Command?.CommandId ?? "";
-    if (!commandId) return `ERROR: no CommandId in SSM response — ${sendRaw.slice(0, 300)}`;
-  } catch {
-    return `ERROR sending SSM command: ${sendRaw.slice(0, 300)}`;
+    // Send the command via SSM SDK
+    const sendRes = await ssm.send(new SendCommandCommand({
+      InstanceIds: [instanceId],
+      DocumentName: "AWS-RunShellScript",
+      Parameters: { commands: [command] },
+      TimeoutSeconds: 60,
+    }));
+
+    const commandId = sendRes.Command?.CommandId;
+    if (!commandId) return `ERROR: no CommandId in SSM response`;
+
+    // Poll GetCommandInvocation until terminal state (max ~45 s).
+    for (let attempt = 0; attempt < 15; attempt++) {
+      await new Promise<void>((res) => setTimeout(res, 3_000));
+
+      try {
+        const inv = await ssm.send(new GetCommandInvocationCommand({
+          CommandId: commandId,
+          InstanceId: instanceId,
+        }));
+
+        const status = inv.Status ?? "";
+        if (status === "Success" || status === "Failed" || status === "Cancelled" || status === "TimedOut") {
+          const stdout = (inv.StandardOutputContent ?? "").trim();
+          const stderr = (inv.StandardErrorContent  ?? "").trim();
+          const lines: string[] = [`EC2_EXEC status=${status} instance=${instanceId} cmd="${command}"`];
+          if (stdout) lines.push(stdout);
+          if (stderr) lines.push(`STDERR: ${stderr}`);
+          return lines.join("\n").slice(0, 6_000);
+        }
+      } catch {
+        // invocation not registered yet — keep trying
+      }
+    }
+
+    return `TIMEOUT: SSM command "${commandId}" did not complete within 45 s on ${instanceId}`;
+  } catch (err: unknown) {
+    return `ERROR: ${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+
+// ─── Tool 7: pi_top_sql ─────────────────────────────────────────────────────
+
+const PI_VALID_PERIODS = [1, 60, 300, 3600] as const;
+function snapPeriod(seconds: number): number {
+  return PI_VALID_PERIODS.reduce<number>((best, p) => (p <= seconds ? p : best), 60);
+}
+
+export async function pi_top_sql(
+  params: Record<string, string>,
+  ctx: ToolContext,
+): Promise<string> {
+  const instanceId = params["instance"]?.trim();
+  if (!instanceId) return `ERROR: instance param required (DB instance identifier)`;
+
+  const region = params["region"]?.trim() || ctx.awsRegion;
+  const sinceHours = Math.max(0.5, parseFloat(params["since_hours"] ?? "1"));
+  const topN = parseInt(params["top"] ?? "10", 10);
+
+  const cfg = awsConfig(ctx, region);
+
+  const rds = new RDSClient(cfg);
+  let dbiResourceId: string;
+  try {
+    const resp = await rds.send(new DescribeDBInstancesCommand({ DBInstanceIdentifier: instanceId }));
+    const inst = resp.DBInstances?.[0];
+    if (!inst?.DbiResourceId) return `ERROR: instance "${instanceId}" not found or missing DbiResourceId`;
+    dbiResourceId = inst.DbiResourceId;
+  } catch (e) {
+    return `ERROR resolving DbiResourceId for "${instanceId}": ${e instanceof Error ? e.message : String(e)}`;
   }
 
-  // Poll GetCommandInvocation until terminal state (max ~45 s).
-  for (let attempt = 0; attempt < 15; attempt++) {
-    await new Promise<void>((res) => setTimeout(res, 3_000));
+  const pi = new PIClient(cfg);
+  const endTime = new Date();
+  const startTime = new Date(endTime.getTime() - sinceHours * 3600 * 1000);
+  const periodInSeconds = snapPeriod(Math.round(sinceHours * 3600));
 
-    const pollRaw = await shell(
-      `aws ssm get-command-invocation` +
-      ` --command-id "${commandId}"` +
-      ` --instance-id "${instanceId}"` +
-      ` --region ${r}` +
-      ` --output json`,
-      10_000,
+  try {
+    const resp = await pi.send(
+      new DescribeDimensionKeysCommand({
+        ServiceType: "RDS",
+        Identifier: dbiResourceId,
+        StartTime: startTime,
+        EndTime: endTime,
+        Metric: "db.load.avg",
+        PeriodInSeconds: periodInSeconds,
+        GroupBy: { Group: "db.sql_tokenized", Limit: topN },
+      }),
     );
 
-    try {
-      const inv = JSON.parse(pollRaw) as {
-        Status?: string;
-        StandardOutputContent?: string;
-        StandardErrorContent?: string;
-        StatusDetails?: string;
-      };
-
-      const status = inv.Status ?? "";
-      if (status === "Success" || status === "Failed" || status === "Cancelled" || status === "TimedOut") {
-        const stdout = (inv.StandardOutputContent ?? "").trim();
-        const stderr = (inv.StandardErrorContent  ?? "").trim();
-        const lines: string[] = [`EC2_EXEC status=${status} instance=${instanceId} cmd="${command}"`];
-        if (stdout) lines.push(stdout);
-        if (stderr) lines.push(`STDERR: ${stderr}`);
-        return lines.join("\n").slice(0, 3_000);
-      }
-      // InProgress / Pending — keep polling
-    } catch {
-      // pollRaw might not be JSON yet (e.g. invocation not registered) — keep trying
+    const keys = resp.Keys ?? [];
+    if (keys.length === 0) {
+      return `No Top SQL data returned for "${instanceId}" over the last ${sinceHours}h. ` +
+        `Performance Insights may not be enabled on this instance.`;
     }
+
+    const rows = keys.map((k, i) => {
+      const load = (k.Total ?? 0).toFixed(3);
+      const sql = (k.Dimensions?.["db.sql_tokenized.statement"] ?? k.Dimensions?.["db.sql_tokenized.id"] ?? "N/A")
+        .replace(/\s+/g, " ")
+        .slice(0, 500);
+      return `${i + 1}. AAS=${load}  ${sql}`;
+    });
+
+    return (
+      `Top ${keys.length} SQL by DB Load (AAS) for "${instanceId}" — last ${sinceHours}h (period=${periodInSeconds}s):\n\n` +
+      rows.join("\n\n")
+    );
+  } catch (e) {
+    return `ERROR querying Performance Insights for "${instanceId}": ${e instanceof Error ? e.message : String(e)}`;
+  }
+}
+
+// ─── Tool 8: ecs_describe ────────────────────────────────────────────────────
+
+/**
+ * Describe ECS clusters, services, tasks, and deployments.
+ * The LLM can drill from cluster → service → tasks.
+ */
+export async function ecs_describe(
+  params: Record<string, string>,
+  ctx: ToolContext,
+): Promise<string> {
+  const r       = params["region"]?.trim() || ctx.awsRegion;
+  const cluster = params["cluster"]?.trim();
+  const service = params["service"]?.trim();
+  const taskId  = params["task_id"]?.trim();
+  const ecs     = new ECSClient(awsConfig(ctx, r));
+
+  try {
+    // If no cluster specified, list all clusters
+    if (!cluster) {
+      const res = await ecs.send(new ListClustersCommand({}));
+      const arns = res.clusterArns ?? [];
+      if (arns.length === 0) return `No ECS clusters found in ${r}`;
+
+      const desc = await ecs.send(new DescribeClustersCommand({ clusters: arns }));
+      const rows = (desc.clusters ?? []).map((c) => {
+        return `${c.clusterName}  status=${c.status}  services=${c.activeServicesCount}  tasks=${c.runningTasksCount}  pending=${c.pendingTasksCount}`;
+      });
+      return `ECS Clusters in ${r} (${rows.length}):\n` + rows.join("\n");
+    }
+
+    // If task_id specified, describe specific tasks
+    if (taskId) {
+      const taskIds = taskId.split(",").map((t) => t.trim());
+      const desc = await ecs.send(new DescribeTasksCommand({ cluster, tasks: taskIds }));
+      const tasks = desc.tasks ?? [];
+      if (tasks.length === 0) return `No tasks found for IDs: ${taskId} in cluster ${cluster}`;
+
+      const rows = tasks.map((t) => {
+        const containers = (t.containers ?? []).map((c) => {
+          return `  container=${c.name} status=${c.lastStatus} health=${c.healthStatus ?? "N/A"} exitCode=${c.exitCode ?? "N/A"} reason=${c.reason ?? "N/A"}`;
+        }).join("\n");
+        return `task=${t.taskArn?.split("/").pop()}  status=${t.lastStatus}  desiredStatus=${t.desiredStatus}  startedAt=${t.startedAt?.toISOString() ?? "N/A"}  stoppedAt=${t.stoppedAt?.toISOString() ?? "N/A"}  stoppedReason=${t.stoppedReason ?? "N/A"}\n${containers}`;
+      });
+      return `ECS Tasks in ${cluster}:\n` + rows.join("\n\n");
+    }
+
+    // If service specified, describe that service
+    if (service) {
+      const desc = await ecs.send(new DescribeServicesCommand({ cluster, services: [service] }));
+      const svcs = desc.services ?? [];
+      if (svcs.length === 0) return `Service "${service}" not found in cluster "${cluster}"`;
+
+      const s = svcs[0];
+      const deployments = (s.deployments ?? []).map((d) => {
+        return `  deployment=${d.id}  status=${d.status}  desired=${d.desiredCount}  running=${d.runningCount}  pending=${d.pendingCount}  rollout=${d.rolloutState ?? "N/A"}  taskDef=${d.taskDefinition?.split("/").pop()}  createdAt=${d.createdAt?.toISOString()}`;
+      }).join("\n");
+
+      const events = (s.events ?? []).slice(0, 10).map((e) => {
+        return `  ${e.createdAt?.toISOString()}  ${e.message}`;
+      }).join("\n");
+
+      // List recent tasks for this service
+      let taskInfo = "";
+      try {
+        const taskList = await ecs.send(new ListTasksCommand({ cluster, serviceName: service, maxResults: 10 }));
+        const taskArns = taskList.taskArns ?? [];
+        if (taskArns.length > 0) {
+          const taskDesc = await ecs.send(new DescribeTasksCommand({ cluster, tasks: taskArns }));
+          taskInfo = "\n\nTasks:\n" + (taskDesc.tasks ?? []).map((t) => {
+            const age = t.startedAt ? `${Math.round((Date.now() - t.startedAt.getTime()) / 60000)}m ago` : "N/A";
+            const containers = (t.containers ?? []).map((c) => `${c.name}:${c.lastStatus}`).join(", ");
+            return `  ${t.taskArn?.split("/").pop()}  status=${t.lastStatus}  started=${age}  containers=[${containers}]  stoppedReason=${t.stoppedReason ?? "N/A"}`;
+          }).join("\n");
+        }
+      } catch { /* task list optional */ }
+
+      return [
+        `ECS Service: ${s.serviceName}  cluster=${cluster}  status=${s.status}`,
+        `desired=${s.desiredCount}  running=${s.runningCount}  pending=${s.pendingCount}`,
+        `taskDef=${s.taskDefinition?.split("/").pop()}  launchType=${s.launchType}`,
+        `healthCheck=${s.healthCheckGracePeriodSeconds ?? 0}s`,
+        `\nDeployments:\n${deployments}`,
+        `\nRecent Events:\n${events}`,
+        taskInfo,
+      ].join("\n");
+    }
+
+    // List services in cluster
+    const listRes = await ecs.send(new ListServicesCommand({ cluster, maxResults: 50 }));
+    const serviceArns = listRes.serviceArns ?? [];
+    if (serviceArns.length === 0) return `No services found in cluster "${cluster}" in ${r}`;
+
+    const desc = await ecs.send(new DescribeServicesCommand({ cluster, services: serviceArns.slice(0, 10) }));
+    const rows = (desc.services ?? []).map((s) => {
+      const deployStatus = s.deployments?.[0]?.rolloutState ?? s.deployments?.[0]?.status ?? "N/A";
+      return `${s.serviceName}  status=${s.status}  desired=${s.desiredCount}  running=${s.runningCount}  pending=${s.pendingCount}  deploy=${deployStatus}`;
+    });
+    return `ECS Services in ${cluster} (${rows.length}):\n` + rows.join("\n");
+  } catch (err: unknown) {
+    return `ERROR: ${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+
+// ─── Tool 9: elb_health ─────────────────────────────────────────────────────
+
+/**
+ * Check ALB/NLB target group health — critical for debugging 5XX errors.
+ */
+export async function elb_health(
+  params: Record<string, string>,
+  ctx: ToolContext,
+): Promise<string> {
+  const r              = params["region"]?.trim() || ctx.awsRegion;
+  const targetGroup    = params["target_group"]?.trim();
+  const loadBalancer   = params["load_balancer"]?.trim();
+  const elb            = new ElasticLoadBalancingV2Client(awsConfig(ctx, r));
+
+  try {
+    // If load_balancer name/ARN given, find its target groups
+    if (loadBalancer && !targetGroup) {
+      // First resolve the LB
+      let lbArn = loadBalancer;
+      if (!loadBalancer.startsWith("arn:")) {
+        const lbs = await elb.send(new DescribeLoadBalancersCommand({ Names: [loadBalancer] }));
+        lbArn = lbs.LoadBalancers?.[0]?.LoadBalancerArn ?? "";
+        if (!lbArn) return `Load balancer "${loadBalancer}" not found in ${r}`;
+      }
+
+      // Get target groups for this LB
+      const tgs = await elb.send(new DescribeTargetGroupsCommand({ LoadBalancerArn: lbArn }));
+      const groups = tgs.TargetGroups ?? [];
+      if (groups.length === 0) return `No target groups for LB "${loadBalancer}" in ${r}`;
+
+      const results: string[] = [];
+      for (const tg of groups) {
+        const health = await elb.send(new DescribeTargetHealthCommand({ TargetGroupArn: tg.TargetGroupArn }));
+        const targets = (health.TargetHealthDescriptions ?? []).map((t) => {
+          const state = t.TargetHealth?.State ?? "unknown";
+          const reason = t.TargetHealth?.Reason ?? "";
+          const desc = t.TargetHealth?.Description ?? "";
+          return `    ${t.Target?.Id}:${t.Target?.Port}  state=${state}${reason ? "  reason=" + reason : ""}${desc ? "  desc=" + desc : ""}`;
+        });
+
+        const healthy   = targets.filter((t) => t.includes("state=healthy")).length;
+        const unhealthy = targets.filter((t) => !t.includes("state=healthy")).length;
+        results.push(
+          `Target Group: ${tg.TargetGroupName}  protocol=${tg.Protocol}  port=${tg.Port}  healthy=${healthy}  unhealthy=${unhealthy}\n` +
+          `  healthCheck: ${tg.HealthCheckProtocol}:${tg.HealthCheckPort}${tg.HealthCheckPath ?? ""}  interval=${tg.HealthCheckIntervalSeconds}s  threshold=${tg.HealthyThresholdCount}/${tg.UnhealthyThresholdCount}\n` +
+          targets.join("\n")
+        );
+      }
+      return results.join("\n\n");
+    }
+
+    // Direct target group lookup
+    if (targetGroup) {
+      let tgArn = targetGroup;
+      if (!targetGroup.startsWith("arn:")) {
+        const tgs = await elb.send(new DescribeTargetGroupsCommand({ Names: [targetGroup] }));
+        tgArn = tgs.TargetGroups?.[0]?.TargetGroupArn ?? "";
+        if (!tgArn) return `Target group "${targetGroup}" not found in ${r}`;
+      }
+
+      const health = await elb.send(new DescribeTargetHealthCommand({ TargetGroupArn: tgArn }));
+      const targets = (health.TargetHealthDescriptions ?? []).map((t) => {
+        const state = t.TargetHealth?.State ?? "unknown";
+        const reason = t.TargetHealth?.Reason ?? "";
+        const desc = t.TargetHealth?.Description ?? "";
+        return `  ${t.Target?.Id}:${t.Target?.Port}  state=${state}${reason ? "  reason=" + reason : ""}${desc ? "  desc=" + desc : ""}`;
+      });
+
+      const healthy   = targets.filter((t) => t.includes("state=healthy")).length;
+      const unhealthy = targets.filter((t) => !t.includes("state=healthy")).length;
+      return `Target Group Health (${targetGroup}) — healthy=${healthy}  unhealthy=${unhealthy}:\n` + targets.join("\n");
+    }
+
+    return "ERROR: provide target_group or load_balancer param";
+  } catch (err: unknown) {
+    return `ERROR: ${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+
+// ─── Tool 10: cloudtrail ────────────────────────────────────────────────────
+
+/**
+ * Look up recent AWS API events — deployments, config changes, permission changes.
+ * Critical for answering "what changed before this outage?"
+ */
+export async function cloudtrail_lookup(
+  params: Record<string, string>,
+  ctx: ToolContext,
+): Promise<string> {
+  const r          = params["region"]?.trim() || ctx.awsRegion;
+  const sinceHours = parseFloat(params["since_hours"] ?? "3");
+  const maxResults = Math.min(parseInt(params["max_results"] ?? "25", 10), 50);
+  const eventName  = params["event_name"]?.trim();
+  const resource   = params["resource_name"]?.trim();
+  const username   = params["username"]?.trim();
+  const ct         = new CloudTrailClient(awsConfig(ctx, r));
+
+  const StartTime = new Date(Date.now() - sinceHours * 3_600_000);
+  const EndTime   = new Date();
+
+  // Build lookup attributes
+  const LookupAttributes: LookupAttribute[] = [];
+  if (eventName) LookupAttributes.push({ AttributeKey: "EventName", AttributeValue: eventName });
+  if (resource)  LookupAttributes.push({ AttributeKey: "ResourceName", AttributeValue: resource });
+  if (username)  LookupAttributes.push({ AttributeKey: "Username", AttributeValue: username });
+
+  try {
+    const res = await ct.send(new LookupEventsCommand({
+      StartTime,
+      EndTime,
+      MaxResults: maxResults,
+      LookupAttributes: LookupAttributes.length > 0 ? LookupAttributes : undefined,
+    }));
+
+    const events = res.Events ?? [];
+    if (events.length === 0) {
+      return `No CloudTrail events found in ${r} last ${sinceHours}h${eventName ? ` for event=${eventName}` : ""}${resource ? ` for resource=${resource}` : ""}`;
+    }
+
+    const rows = events.map((e) => {
+      const resources = (e.Resources ?? []).map((r) => `${r.ResourceType}:${r.ResourceName}`).join(", ");
+      return `${e.EventTime?.toISOString()}  ${e.EventName}  by=${e.Username ?? "N/A"}  resources=[${resources}]  source=${e.EventSource ?? "N/A"}`;
+    });
+
+    return `CloudTrail events in ${r} last ${sinceHours}h (${events.length} events):\n` + rows.join("\n");
+  } catch (err: unknown) {
+    return `ERROR: ${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+
+// ─── Tool 11: asg_activity ──────────────────────────────────────────────────
+
+/**
+ * Auto Scaling group recent scaling activities and configuration.
+ */
+export async function asg_activity(
+  params: Record<string, string>,
+  ctx: ToolContext,
+): Promise<string> {
+  const r       = params["region"]?.trim() || ctx.awsRegion;
+  const asgName = params["asg_name"]?.trim();
+  const asc     = new AutoScalingClient(awsConfig(ctx, r));
+
+  try {
+    if (!asgName) {
+      // List all ASGs
+      const res = await asc.send(new DescribeAutoScalingGroupsCommand({ MaxRecords: 50 }));
+      const groups = res.AutoScalingGroups ?? [];
+      if (groups.length === 0) return `No Auto Scaling groups found in ${r}`;
+
+      const rows = groups.map((g) => {
+        return `${g.AutoScalingGroupName}  desired=${g.DesiredCapacity}  min=${g.MinSize}  max=${g.MaxSize}  instances=${g.Instances?.length ?? 0}  health=[${(g.Instances ?? []).map((i) => `${i.InstanceId}:${i.HealthStatus}`).join(", ")}]`;
+      });
+      return `Auto Scaling Groups in ${r} (${rows.length}):\n` + rows.join("\n");
+    }
+
+    // Get ASG details + recent activities
+    const [descRes, actRes] = await Promise.all([
+      asc.send(new DescribeAutoScalingGroupsCommand({ AutoScalingGroupNames: [asgName] })),
+      asc.send(new DescribeScalingActivitiesCommand({ AutoScalingGroupName: asgName, MaxRecords: 20 })),
+    ]);
+
+    const group = descRes.AutoScalingGroups?.[0];
+    if (!group) return `ASG "${asgName}" not found in ${r}`;
+
+    const instances = (group.Instances ?? []).map((i) => {
+      return `  ${i.InstanceId}  az=${i.AvailabilityZone}  lifecycle=${i.LifecycleState}  health=${i.HealthStatus}`;
+    }).join("\n");
+
+    const activities = (actRes.Activities ?? []).map((a) => {
+      return `  ${a.StartTime?.toISOString()}  status=${a.StatusCode}  cause=${(a.Cause ?? "").slice(0, 200)}`;
+    }).join("\n");
+
+    return [
+      `ASG: ${group.AutoScalingGroupName}  desired=${group.DesiredCapacity}  min=${group.MinSize}  max=${group.MaxSize}`,
+      `launchTemplate=${group.LaunchTemplate?.LaunchTemplateName ?? group.LaunchConfigurationName ?? "N/A"}`,
+      `\nInstances (${group.Instances?.length ?? 0}):\n${instances}`,
+      `\nRecent Scaling Activities:\n${activities}`,
+    ].join("\n");
+  } catch (err: unknown) {
+    return `ERROR: ${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+
+// ─── Tool 12: route53_check ─────────────────────────────────────────────────
+
+/**
+ * Look up DNS records in Route 53 hosted zones.
+ */
+export async function route53_check(
+  params: Record<string, string>,
+  ctx: ToolContext,
+): Promise<string> {
+  const domain    = params["domain"]?.trim();
+  const zoneId    = params["zone_id"]?.trim();
+  const r53       = new Route53Client(awsConfig(ctx));
+
+  try {
+    // If no zone_id, list hosted zones or find one matching the domain
+    let resolvedZoneId = zoneId;
+    if (!resolvedZoneId) {
+      const zones = await r53.send(new ListHostedZonesCommand({}));
+      const allZones = zones.HostedZones ?? [];
+
+      if (!domain) {
+        // Just list zones
+        if (allZones.length === 0) return "No Route 53 hosted zones found";
+        const rows = allZones.map((z) => `${z.Id?.replace("/hostedzone/", "")}  ${z.Name}  records=${z.ResourceRecordSetCount}  private=${z.Config?.PrivateZone ?? false}`);
+        return `Route 53 Hosted Zones (${rows.length}):\n` + rows.join("\n");
+      }
+
+      // Find zone matching domain
+      const match = allZones.find((z) => domain.endsWith(z.Name?.replace(/\.$/, "") ?? ""));
+      if (!match) return `No hosted zone found for domain "${domain}". Available zones: ${allZones.map((z) => z.Name).join(", ")}`;
+      resolvedZoneId = match.Id?.replace("/hostedzone/", "") ?? "";
+    }
+
+    if (!resolvedZoneId) return "ERROR: could not resolve zone_id";
+
+    const records = await r53.send(new ListResourceRecordSetsCommand({
+      HostedZoneId: resolvedZoneId,
+      StartRecordName: domain,
+      MaxItems: 20,
+    }));
+
+    const sets = records.ResourceRecordSets ?? [];
+    if (sets.length === 0) return `No records found in zone ${resolvedZoneId}`;
+
+    const rows = sets
+      .filter((rs) => !domain || rs.Name?.includes(domain))
+      .map((rs) => {
+        const values = rs.ResourceRecords?.map((rr) => rr.Value).join(", ") ?? "";
+        const alias = rs.AliasTarget ? `ALIAS→${rs.AliasTarget.DNSName}` : "";
+        return `${rs.Name}  ${rs.Type}  TTL=${rs.TTL ?? "N/A"}  ${values}${alias}`;
+      });
+
+    return `Route 53 Records (zone=${resolvedZoneId}):\n` + rows.join("\n");
+  } catch (err: unknown) {
+    return `ERROR: ${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+
+// ─── Tool 13: k8s_pods ──────────────────────────────────────────────────────
+
+/**
+ * Structured pod status — detects CrashLoopBackOff, OOMKilled, restarts,
+ * pending pods, and image pull errors.
+ */
+export async function k8s_pods(
+  params: Record<string, string>,
+  ctx: ToolContext,
+): Promise<string> {
+  const namespace = params["namespace"]?.trim() || "default";
+  const selector  = params["selector"]?.trim();
+  const name      = params["name"]?.trim();
+
+  let cmd = `kubectl get pods -n ${namespace} -o json`;
+  if (selector) cmd += ` -l ${selector}`;
+  if (name) cmd += ` --field-selector metadata.name=${name}`;
+
+  if (ctx.k8sContext) cmd += ` --context ${ctx.k8sContext}`;
+
+  const raw = await shell(cmd, 15_000);
+  try {
+    const data = JSON.parse(raw) as {
+      items: Array<{
+        metadata: { name: string; namespace: string; creationTimestamp: string };
+        status: {
+          phase: string;
+          conditions?: Array<{ type: string; status: string; reason?: string; message?: string }>;
+          containerStatuses?: Array<{
+            name: string;
+            ready: boolean;
+            restartCount: number;
+            state: Record<string, { reason?: string; exitCode?: number; startedAt?: string; message?: string }>;
+            lastState?: Record<string, { reason?: string; exitCode?: number; finishedAt?: string }>;
+          }>;
+        };
+        spec: { nodeName?: string; containers: Array<{ name: string; image: string; resources?: { requests?: Record<string, string>; limits?: Record<string, string> } }> };
+      }>;
+    };
+
+    const pods = data.items ?? [];
+    if (pods.length === 0) return `No pods found in namespace=${namespace}${selector ? ` selector=${selector}` : ""}`;
+
+    const rows = pods.map((p) => {
+      const containers = (p.status.containerStatuses ?? []).map((c) => {
+        const stateKey = Object.keys(c.state)[0] ?? "unknown";
+        const stateDetail = c.state[stateKey];
+        const reason = stateDetail?.reason ?? "";
+        const exitCode = stateDetail?.exitCode;
+        const lastReason = c.lastState ? Object.values(c.lastState)[0]?.reason ?? "" : "";
+        return `  container=${c.name} ready=${c.ready} restarts=${c.restartCount} state=${stateKey}${reason ? "/" + reason : ""}${exitCode !== undefined ? " exit=" + exitCode : ""}${lastReason ? " lastCrash=" + lastReason : ""}`;
+      }).join("\n");
+
+      const conditions = (p.status.conditions ?? [])
+        .filter((c) => c.status === "False")
+        .map((c) => `  condition=${c.type}=False reason=${c.reason ?? "N/A"} msg=${c.message?.slice(0, 100) ?? ""}`)
+        .join("\n");
+
+      const node = p.spec.nodeName ?? "unscheduled";
+      const age = Math.round((Date.now() - new Date(p.metadata.creationTimestamp).getTime()) / 60000);
+
+      return `pod=${p.metadata.name}  ns=${p.metadata.namespace}  phase=${p.status.phase}  node=${node}  age=${age}m\n${containers}${conditions ? "\n" + conditions : ""}`;
+    });
+
+    // Summary
+    const phases: Record<string, number> = {};
+    let totalRestarts = 0;
+    let crashLoops = 0;
+    for (const p of pods) {
+      phases[p.status.phase] = (phases[p.status.phase] ?? 0) + 1;
+      for (const c of p.status.containerStatuses ?? []) {
+        totalRestarts += c.restartCount;
+        const stateKey = Object.keys(c.state)[0];
+        if (c.state[stateKey]?.reason === "CrashLoopBackOff") crashLoops++;
+      }
+    }
+
+    const summary = `Pods in ${namespace} (${pods.length} total): ${Object.entries(phases).map(([k, v]) => `${k}=${v}`).join(" ")}  totalRestarts=${totalRestarts}  crashLoops=${crashLoops}`;
+
+    return summary + "\n\n" + rows.join("\n\n");
+  } catch {
+    // Fallback: raw kubectl output (maybe kubectl returned an error)
+    return raw;
+  }
+}
+
+// ─── Tool 14: k8s_events ────────────────────────────────────────────────────
+
+/**
+ * Recent Kubernetes events — warnings, errors, scaling events, scheduling failures.
+ */
+export async function k8s_events(
+  params: Record<string, string>,
+  ctx: ToolContext,
+): Promise<string> {
+  const namespace = params["namespace"]?.trim();
+  const severity  = params["severity"]?.trim()?.toLowerCase() ?? "warning"; // "warning" or "all"
+  const since     = params["since"]?.trim() || "1h";
+  const name      = params["involved_object"]?.trim();
+
+  let cmd = `kubectl get events`;
+  if (namespace && namespace !== "all") {
+    cmd += ` -n ${namespace}`;
+  } else {
+    cmd += ` --all-namespaces`;
+  }
+  cmd += ` --sort-by=.lastTimestamp -o json`;
+  if (ctx.k8sContext) cmd += ` --context ${ctx.k8sContext}`;
+
+  const raw = await shell(cmd, 15_000);
+  try {
+    const data = JSON.parse(raw) as {
+      items: Array<{
+        type: string;
+        reason: string;
+        message: string;
+        involvedObject: { kind: string; name: string; namespace?: string };
+        firstTimestamp?: string;
+        lastTimestamp?: string;
+        count?: number;
+        source?: { component: string };
+      }>;
+    };
+
+    let events = data.items ?? [];
+
+    // Filter by severity
+    if (severity === "warning") {
+      events = events.filter((e) => e.type === "Warning");
+    }
+
+    // Filter by involved object name
+    if (name) {
+      events = events.filter((e) => e.involvedObject.name.includes(name));
+    }
+
+    // Filter by time
+    const sinceMs = parseDuration(since);
+    const cutoff = Date.now() - sinceMs;
+    events = events.filter((e) => {
+      const ts = e.lastTimestamp ? new Date(e.lastTimestamp).getTime() : 0;
+      return ts > cutoff;
+    });
+
+    if (events.length === 0) {
+      return `No ${severity} events found${namespace ? ` in namespace=${namespace}` : ""}${name ? ` for ${name}` : ""} in last ${since}`;
+    }
+
+    // Take latest 50
+    events = events.slice(-50);
+
+    const rows = events.map((e) => {
+      return `${e.lastTimestamp ?? "?"}  ${e.type}  ${e.reason}  ${e.involvedObject.kind}/${e.involvedObject.name}${e.involvedObject.namespace ? " ns=" + e.involvedObject.namespace : ""}  count=${e.count ?? 1}  msg=${e.message.slice(0, 200)}`;
+    });
+
+    return `K8s Events (${events.length}, severity=${severity}, last ${since}):\n` + rows.join("\n");
+  } catch {
+    return raw;
+  }
+}
+
+// ─── Tool 15: k8s_logs ──────────────────────────────────────────────────────
+
+/**
+ * Fetch logs from a pod/container with optional grep filtering.
+ */
+export async function k8s_logs(
+  params: Record<string, string>,
+  ctx: ToolContext,
+): Promise<string> {
+  const pod       = params["pod"]?.trim();
+  const namespace = params["namespace"]?.trim() || "default";
+  const container = params["container"]?.trim();
+  const since     = params["since"]?.trim() || "1h";
+  const grep      = params["grep"]?.trim();
+  const tail      = params["tail"]?.trim() || "100";
+  const previous  = params["previous"]?.trim() === "true";
+
+  if (!pod) return "ERROR: pod param is required";
+
+  let cmd = `kubectl logs ${pod} -n ${namespace} --since=${since} --tail=${tail}`;
+  if (container) cmd += ` -c ${container}`;
+  if (previous) cmd += ` --previous`;
+  if (ctx.k8sContext) cmd += ` --context ${ctx.k8sContext}`;
+  if (grep) cmd += ` | grep -i "${grep}"`;
+
+  const raw = await shell(cmd, 15_000);
+  if (!raw || raw === "(no output)") {
+    return `No logs for pod=${pod} container=${container ?? "all"} in ns=${namespace} last ${since}${grep ? ` matching "${grep}"` : ""}`;
   }
 
-  return `TIMEOUT: SSM command "${commandId}" did not complete within 45 s on ${instanceId}`;
+  return `Logs: pod=${pod} ns=${namespace}${container ? " container=" + container : ""} last ${since}${grep ? ` grep="${grep}"` : ""}${previous ? " (previous)" : ""}:\n${raw}`;
 }
 
-// ─── Tool catalog (shown to LLM in every prompt) ─────────────────────────────
+// ─── Tool 16: mcp_tool ──────────────────────────────────────────────────────
 
-/**
- * Build the tool catalog string shown to the LLM on the first investigation step.
- * When an AWS MCP server is connected, discovered tools are appended so the LLM
- * knows it can call richer, purpose-built AWS APIs through mcp_tool().
- */
-export function buildToolCatalog(mcpTools?: AwsMcpTool[]): string {
-  const base = `TOOLS:
-
-1. run_command(command: string)
-   Execute any read-only shell command. k8s context auto-injected for kubectl/helm.
-   Use for: kubectl, helm, dig, nslookup, curl, nc, ping, openssl, ssh, traceroute.
-   Do NOT use for AWS — use the SDK tools below instead.
-
-2. aws_query(type: string, region?: string, max_results?: string, filter?: string, name_filter?: string)
-   List AWS resources by CloudFormation type via Cloud Control SDK (no CLI needed).
-   filter: optional JSON ResourceModel string to scope results, e.g. '{"VpcId":"vpc-0abc"}'.
-   name_filter: substring to match against identifier + properties — auto-paginates ALL pages (e.g. name_filter="qa-cms-host-alb").
-
-3. aws_get(type: string, identifier: string, region?: string)
-   Fetch full properties of one AWS resource. identifier must be a real resource ID from aws_query.
-
-4. ec2_exec(instance_id: string, command: string, region?: string)
-   Run a command inside an EC2 instance via SSM (no SSH key needed).
-
-5. cw_metrics(namespace: string, metric: string, dimensions?: string, since_hours?: string, period_minutes?: string, statistic?: string, region?: string)
-   Fetch CloudWatch metric statistics. dimensions format: "Key=Value" or "Key1=V1,Key2=V2".
-   ALB: namespace=AWS/ApplicationELB, dimension LoadBalancer=app/<name>/<hash> (ARN suffix after "loadbalancer/").
-   Common ALB metrics: HTTPCode_Target_4XX_Count, HTTPCode_Target_5XX_Count, HTTPCode_ELB_5XX_Count, RequestCount, TargetResponseTime. Use statistic=Sum for error counts.
-
-6. cw_logs(log_group: string, filter_pattern?: string, since_hours?: string, limit?: string, region?: string)
-   Search CloudWatch Logs. log_group can be a full name or prefix.`;
-
-  if (!mcpTools || mcpTools.length === 0) return base;
-
-  const mcpSection = mcpTools
-    .map((t, i) => {
-      const paramList = t.params.length > 0 ? `(${t.params.join(", ")})` : "()";
-      return `${7 + i}. mcp_tool  name="${t.name}"${paramList}\n   ${t.description}`;
-    })
-    .join("\n\n");
-
-  return (
-    base +
-    `\n\n7+. mcp_tool(name: string, ...args)  [AWS MCP SERVER — prefer these over SDK tools when available]\n` +
-    `   Call any AWS MCP server tool directly. Pass name= plus the tool's own parameters.\n` +
-    `   Example: {"tool":"mcp_tool","params":{"name":"list_load_balancers","region":"ap-southeast-1"}}\n\n` +
-    `   Available MCP tools:\n` +
-    mcpSection
-  );
-}
-
-// ─── Tool 7: mcp_tool ─────────────────────────────────────────────────────────
-
-/**
- * Route a call to any tool advertised by the connected AWS MCP server.
- * The LLM passes name= (the MCP tool name) plus the tool's own parameters.
- * Falls back with a clear error if MCP is not configured or not connected.
- *
- * Example params: { name: "list_load_balancers", region: "ap-southeast-1" }
- */
 export async function mcp_tool(
   params: Record<string, string>,
   ctx: ToolContext,
@@ -590,16 +1143,118 @@ export async function mcp_tool(
   if (!ctx.mcpService?.isConnected()) {
     return (
       `ERROR: AWS MCP server not connected. ` +
-      `Configure with AWS_MCP_URL=http://<host>/mcp or AWS_MCP_TRANSPORT=stdio + AWS_MCP_COMMAND.`
+      `Configure with AWS_MCP_SERVERS=cloudwatch,cloudtrail`
     );
   }
 
-  // Strip "name" key; pass the rest as args to the MCP tool.
   const { name: _name, ...rest } = params;
   return ctx.mcpService.callTool(toolName, rest as Record<string, unknown>);
 }
 
-// ─── Dispatcher ───────────────────────────────────────────────────────────────
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/** Parse "30m", "1h", "6h", "24h" to milliseconds. */
+function parseDuration(s: string): number {
+  const match = s.match(/^(\d+(?:\.\d+)?)\s*(m|h|d)$/);
+  if (!match) return 3_600_000; // default 1h
+  const val = parseFloat(match[1]);
+  switch (match[2]) {
+    case "m": return val * 60_000;
+    case "h": return val * 3_600_000;
+    case "d": return val * 86_400_000;
+    default: return 3_600_000;
+  }
+}
+
+// ─── Tool catalog (shown to LLM in every prompt) ────────────────────────────
+
+export function buildToolCatalog(mcpTools?: AwsMcpTool[]): string {
+  const base = `TOOLS:
+
+1. run_command(command: string)
+   Execute any read-only shell command. k8s context auto-injected for kubectl/helm.
+   Use for: dig, nslookup, curl, nc, ping, openssl, ssh, traceroute.
+   Do NOT use for AWS CLI or kubectl (use dedicated tools below).
+
+2. aws_query(type: string, region?: string, max_results?: string, filter?: string, name_filter?: string)
+   List AWS resources by CloudFormation type via Cloud Control SDK.
+   filter: optional JSON ResourceModel string to scope results, e.g. '{"VpcId":"vpc-0abc"}'.
+   name_filter: substring match against identifier + properties — auto-paginates ALL pages.
+
+3. aws_get(type: string, identifier: string, region?: string)
+   Fetch full properties of one AWS resource. identifier must be a real resource ID from aws_query.
+
+4. ec2_exec(instance_id: string, command: string, region?: string)
+   Run a command inside an EC2 instance via SSM SDK (no SSH key or AWS CLI needed).
+
+5. cw_metrics(namespace: string, metric: string, dimensions?: string, since_hours?: string, period_minutes?: string, statistic?: string, region?: string)
+   Fetch CloudWatch metric statistics. dimensions format: "Key=Value" or "Key1=V1,Key2=V2".
+   Works for ALL metric types (counts, bytes, ms, percent — no unit restriction).
+   ALB: namespace=AWS/ApplicationELB, dimension LoadBalancer=app/<name>/<hash> (ARN suffix after "loadbalancer/").
+   Common ALB metrics: HTTPCode_Target_4XX_Count, HTTPCode_Target_5XX_Count, RequestCount, TargetResponseTime.
+   Use statistic=Sum for counts, Average for rates/latency.
+
+6. cw_logs(log_group: string, filter_pattern?: string, since_hours?: string, limit?: string, region?: string)
+   Search CloudWatch Logs. log_group can be a full name or prefix (auto-discovered).
+   limit defaults to 50, max 100.
+
+7. pi_top_sql(instance: string, top?: string, since_hours?: string, region?: string)
+   Top SQL queries by DB Load (Average Active Sessions) via Performance Insights API.
+   instance = DB instance identifier (e.g. "comics-master-db"). top defaults to 10.
+
+8. ecs_describe(cluster?: string, service?: string, task_id?: string, region?: string)
+   ECS cluster/service/task inspection. Drill down: clusters → services → tasks.
+   No params = list all clusters. cluster only = list services. cluster+service = full detail with deployments, events, tasks.
+   cluster+task_id = specific task containers and stopped reasons.
+
+9. elb_health(load_balancer?: string, target_group?: string, region?: string)
+   ALB/NLB target group health. Shows healthy/unhealthy targets with reasons.
+   load_balancer = name or ARN → lists all target groups + health.
+   target_group = name or ARN → health for that specific group.
+
+10. cloudtrail(event_name?: string, resource_name?: string, username?: string, since_hours?: string, max_results?: string, region?: string)
+    Recent AWS API events from CloudTrail — deployments, config changes, permission changes.
+    Use for: "what changed?", "who deployed?", "recent config changes".
+    event_name examples: "UpdateService", "CreateDeployment", "PutScalingPolicy", "RunInstances".
+
+11. asg_activity(asg_name?: string, region?: string)
+    Auto Scaling group config and recent scaling activities.
+    No asg_name = list all ASGs with instance health. With asg_name = details + scaling history.
+
+12. route53_check(domain?: string, zone_id?: string)
+    Route 53 DNS lookup. No params = list hosted zones. domain = find matching zone and records.
+
+13. k8s_pods(namespace?: string, selector?: string, name?: string)
+    Structured pod status with restart counts, CrashLoopBackOff detection, OOMKilled, exit codes.
+    namespace defaults to "default". selector = label selector (e.g. "app=checkout-api").
+
+14. k8s_events(namespace?: string, severity?: string, since?: string, involved_object?: string)
+    Recent K8s events. severity="warning" (default) or "all". since="1h" (default).
+    involved_object = filter by resource name.
+
+15. k8s_logs(pod: string, namespace?: string, container?: string, since?: string, grep?: string, tail?: string, previous?: string)
+    Pod logs with optional grep filtering. previous="true" for crashed container logs.`;
+
+  if (!mcpTools || mcpTools.length === 0) return base;
+
+  const mcpSection = mcpTools
+    .map((t, i) => {
+      const paramList = t.params.length > 0 ? `(${t.params.join(", ")})` : "()";
+      return `${16 + i}. mcp_tool  name="${t.name}"${paramList}\n   ${t.description}`;
+    })
+    .join("\n\n");
+
+  return (
+    base +
+    `\n\n16+. mcp_tool(name: string, ...args)  [AWS MCP SERVER — prefer these over SDK tools when available]\n` +
+    `   Call any AWS MCP server tool directly. Pass name= plus the tool's own parameters.\n` +
+    `   Example: {"tool":"mcp_tool","params":{"name":"list_load_balancers","region":"ap-southeast-1"}}\n\n` +
+    `   Available MCP tools:\n` +
+    mcpSection
+  );
+}
+
+// ─── Dispatcher ──────────────────────────────────────────────────────────────
 
 export async function executeTool(
   name: string,
@@ -607,22 +1262,30 @@ export async function executeTool(
   ctx: ToolContext,
 ): Promise<string> {
   switch (name) {
-    case "run_command": return run_command(params, ctx);
-    case "aws_query":   return aws_query(params, ctx);
-    case "aws_get":     return aws_get(params, ctx);
-    case "ec2_exec":    return ec2_exec(params, ctx);
-    case "cw_metrics":  return cw_metrics(params, ctx);
-    case "cw_logs":     return cw_logs(params, ctx);
-    case "mcp_tool":    return mcp_tool(params, ctx);
+    case "run_command":       return run_command(params, ctx);
+    case "aws_query":         return aws_query(params, ctx);
+    case "aws_get":           return aws_get(params, ctx);
+    case "ec2_exec":          return ec2_exec(params, ctx);
+    case "cw_metrics":        return cw_metrics(params, ctx);
+    case "cw_logs":           return cw_logs(params, ctx);
+    case "pi_top_sql":        return pi_top_sql(params, ctx);
+    case "ecs_describe":      return ecs_describe(params, ctx);
+    case "elb_health":        return elb_health(params, ctx);
+    case "cloudtrail":        return cloudtrail_lookup(params, ctx);
+    case "cloudtrail_lookup": return cloudtrail_lookup(params, ctx);
+    case "asg_activity":      return asg_activity(params, ctx);
+    case "route53_check":     return route53_check(params, ctx);
+    case "k8s_pods":          return k8s_pods(params, ctx);
+    case "k8s_events":        return k8s_events(params, ctx);
+    case "k8s_logs":          return k8s_logs(params, ctx);
+    case "mcp_tool":          return mcp_tool(params, ctx);
     default: {
-      // Auto-route: if the LLM calls an MCP tool by its bare name (e.g.
-      // "get_active_alarms" instead of mcp_tool with name="get_active_alarms"),
-      // detect it and route transparently so the call still succeeds.
+      // Auto-route MCP tool names
       if (ctx.mcpService?.isConnected()) {
         const known = ctx.mcpService.getDiscoveredTools().some((t) => t.name === name);
         if (known) return mcp_tool({ name, ...params }, ctx);
       }
-      return `ERROR: Unknown tool "${name}". Available: run_command, aws_query, aws_get, ec2_exec, cw_metrics, cw_logs, mcp_tool`;
+      return `ERROR: Unknown tool "${name}". Available: run_command, aws_query, aws_get, ec2_exec, cw_metrics, cw_logs, pi_top_sql, ecs_describe, elb_health, cloudtrail, asg_activity, route53_check, k8s_pods, k8s_events, k8s_logs, mcp_tool`;
     }
   }
 }

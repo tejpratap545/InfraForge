@@ -40,21 +40,27 @@ type LLMResponse =
   | { done: false; thought: string; calls: ToolCall[];  tool?: never; params?: never }
   | { done: true;  thought: string; answer: string };
 
-const MAX_STEPS = 20;
+const MAX_STEPS = 25;
+
+// Token limits: tool-calling steps need less, conclusions need more room.
+const STEP_MAX_TOKENS = 3072;
+const CONCLUSION_MAX_TOKENS = 4096;
 
 // ─── History compression ──────────────────────────────────────────────────────
 
 function compressHistory(steps: Step[]): string {
   if (steps.length === 0) return "(no steps yet — begin triage)";
-  const recentFrom = Math.max(0, steps.length - 3);
+  // Show last 5 steps in full detail, compress older ones to key findings
+  const recentFrom = Math.max(0, steps.length - 5);
   return steps
     .map((s, i) => {
       if (i >= recentFrom) {
-        const result = s.result.slice(0, 400) + (s.result.length > 400 ? "\n  ...(truncated)" : "");
+        const result = s.result.slice(0, 800) + (s.result.length > 800 ? "\n  ...(truncated)" : "");
         return `[${i + 1}] ${s.tool}(${JSON.stringify(s.params)})\n  THOUGHT: ${s.thought}\n  RESULT: ${result}`;
       }
-      const keyLine = s.result.split("\n").find((l) => l.trim().length > 10) ?? s.result;
-      return `[${i + 1}] ${s.tool} → ${keyLine.slice(0, 120)}`;
+      // Older steps: keep 2 key lines instead of just 1
+      const keyLines = s.result.split("\n").filter((l) => l.trim().length > 10).slice(0, 2);
+      return `[${i + 1}] ${s.tool} → ${keyLines.join(" | ").slice(0, 250)}`;
     })
     .join("\n\n");
 }
@@ -287,7 +293,7 @@ export class DiagnoseAgent {
       try {
         raw = await this.bedrock.complete(
           systemPrompt(question, awsRegion, steps, options, toolCatalog, mcpTools),
-          { maxTokens: 2048 },
+          { maxTokens: STEP_MAX_TOKENS },
         );
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
@@ -372,7 +378,7 @@ export class DiagnoseAgent {
         const forcePrompt =
           systemPrompt(question, awsRegion, steps, options, toolCatalog, mcpTools) +
           "\n\nStep limit reached. You MUST conclude now — set done=true and give your best root cause using all evidence gathered.";
-        const raw2 = await this.bedrock.complete(forcePrompt, { maxTokens: 2048 });
+        const raw2 = await this.bedrock.complete(forcePrompt, { maxTokens: CONCLUSION_MAX_TOKENS });
         const p2 = parseJsonPayload(raw2, "force-conclusion") as LLMResponse;
         finalAnswer = p2.done
           ? (p2 as { done: true; answer: string }).answer
