@@ -197,7 +197,9 @@ async function executeMode(
   reasoning: string,
   input: string,
   tenant: TenantContext,
+  tfDir?: string,
 ): Promise<void> {
+  const { resolve } = await import("node:path");
   const r = reasoning as "quick" | "standard" | "deep";
   switch (modeId) {
     case "ask":
@@ -209,15 +211,27 @@ async function executeMode(
     case "plan:create":
       if (engine === "aws") {
         await workflow.createWithAwsSdk(input, tenant);
+      } else if (tfDir) {
+        await workflow.updateExisting(input, resolve(tfDir), tenant);
       } else {
         await workflow.createOrUpdate(input, tenant);
       }
       break;
     case "plan:dryrun":
+      if (tfDir) {
+        // planOnly doesn't accept tfDir — show a note and fall through to standard planOnly
+        console.log(c.dim(`  Using existing TF dir: ${tfDir}`));
+      }
       await workflow.planOnly(input, tenant);
       break;
     case "plan:apply":
-      await workflow.applyExisting(input, tenant);
+      if (engine === "aws") {
+        await workflow.createWithAwsSdk(input, tenant);
+      } else if (tfDir) {
+        await workflow.updateExisting(input, resolve(tfDir), tenant);
+      } else {
+        await workflow.applyExisting(input, tenant);
+      }
       break;
     default:
       throw new Error(`Unknown mode: ${modeId}`);
@@ -235,8 +249,11 @@ function getModePrompt(modeId: string): string {
   }
 }
 
-function getModeHint(mode: MenuItem, model: MenuItem, reasoning: MenuItem): string {
-  const status    = `${c.dim("mode:")} ${c.cyan(mode.label)}  ${c.dim("model:")} ${c.cyan(model.label)}  ${c.dim("reasoning:")} ${c.cyan(reasoning.label)}`;
+function getModeHint(mode: MenuItem, model: MenuItem, reasoning: MenuItem, engine?: MenuItem, tfDir?: string): string {
+  let status = `${c.dim("mode:")} ${c.cyan(mode.label)}`;
+  if (IS_PLAN(mode.id) && engine) status += `  ${c.dim("provider:")} ${c.cyan(engine.label)}`;
+  if (tfDir)                      status += `  ${c.dim("tf-dir:")} ${c.cyan(tfDir)}`;
+  status += `  ${c.dim("reasoning:")} ${c.cyan(reasoning.label)}  ${c.dim("model:")} ${c.cyan(model.label)}`;
   const switchHint = c.dim(`  /mode · /model · /switch to change    /exit to quit`);
 
   let example = "";
@@ -253,22 +270,66 @@ function getModeHint(mode: MenuItem, model: MenuItem, reasoning: MenuItem): stri
 
 // ─── Mode + model + reasoning picker (with back-navigation) ──────────────────
 
-async function pickSession(): Promise<{ mode: MenuItem; model: MenuItem; reasoning: MenuItem; engine: MenuItem }> {
+const IS_PLAN = (id: string) => id.startsWith("plan:");
+
+/** Returns cwd if it contains .tf files, otherwise undefined. */
+function detectTfDir(): string | undefined {
+  try {
+    const { readdirSync } = require("node:fs") as typeof import("node:fs");
+    const { cwd } = require("node:process") as typeof import("node:process");
+    const dir = cwd();
+    const hasTf = readdirSync(dir).some((f: string) => f.endsWith(".tf"));
+    return hasTf ? dir : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function pickSession(): Promise<{ mode: MenuItem; model: MenuItem; reasoning: MenuItem; engine: MenuItem; tfDir?: string }> {
   while (true) {
     const mode = await selectMenu("Mode", MODES, false);
     if (!mode) continue;
 
-    // Plan commands need an engine selection
+    // Plan commands: pick engine (aws or terraform)
     let engine = ENGINE[0]; // default terraform
-    if (mode.id === "plan:create" || mode.id === "plan:apply") {
-      while (true) {
-        const picked = await selectMenu("Engine", ENGINE, true);
-        if (!picked) break; // go back to mode
-        engine = picked;
-        break;
+    let tfDir: string | undefined;
+
+    if (IS_PLAN(mode.id)) {
+      if (mode.id === "plan:dryrun") {
+        // dry-run is always terraform — skip provider menu, auto-use cwd if it has .tf files
+        engine = ENGINE[0];
+        tfDir = detectTfDir();
+        if (tfDir) {
+          console.log(`\n  ${c.green("✓")}  ${c.dim("Terraform dir:")}  ${c.cyan(tfDir)}  ${c.dim("(auto-detected)")}\n`);
+        }
+      } else {
+        // create / apply — let user pick provider
+        while (true) {
+          const picked = await selectMenu("Provider", ENGINE, true);
+          if (!picked) break; // go back to mode picker
+          engine = picked;
+
+          if (engine.id === "terraform") {
+            const detected = detectTfDir();
+            if (detected) {
+              // Auto-detected: confirm or override
+              const dir = await textInput(
+                "Terraform directory",
+                `Auto-detected: ${detected}  (press Enter to use it, or type a different path)`,
+              );
+              tfDir = dir || detected;
+            } else {
+              // Nothing detected: ask, allow skip
+              const dir = await textInput(
+                "Terraform directory (optional)",
+                "Path to an existing .tf directory to patch — press Enter to skip",
+              );
+              tfDir = dir || undefined;
+            }
+          }
+          break;
+        }
       }
-      // If user backed out of engine, re-pick mode
-      if (engine === ENGINE[0] && mode.id === "plan:apply") { /* ok, terraform default */ }
     }
 
     while (true) {
@@ -279,7 +340,7 @@ async function pickSession(): Promise<{ mode: MenuItem; model: MenuItem; reasoni
         const model = await selectMenu("Model", MODELS, true);
         if (!model) break; // go back to reasoning
 
-        return { mode, model, reasoning, engine };
+        return { mode, model, reasoning, engine, tfDir };
       }
     }
   }
@@ -306,16 +367,18 @@ export async function runInteractiveSession(
 ): Promise<void> {
   printSessionHeader(tenant);
 
-  let { mode, model, reasoning, engine } = await pickSession();
+  let { mode, model, reasoning, engine, tfDir } = await pickSession();
 
   console.log("");
-  printKV("Mode",      c.bold(mode.label),      { keyWidth: 12 });
-  printKV("Reasoning", c.bold(reasoning.label), { keyWidth: 12 });
-  printKV("Model",     c.bold(model.label),      { keyWidth: 12 });
+  printKV("Mode",      c.bold(mode.label),              { keyWidth: 12 });
+  if (IS_PLAN(mode.id)) printKV("Provider", c.bold(engine.label), { keyWidth: 12 });
+  if (tfDir)            printKV("TF dir",   c.dim(tfDir),         { keyWidth: 12 });
+  printKV("Reasoning", c.bold(reasoning.label),         { keyWidth: 12 });
+  printKV("Model",     c.bold(model.label),              { keyWidth: 12 });
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
-    const input = await textInput(getModePrompt(mode.id), getModeHint(mode, model, reasoning));
+    const input = await textInput(getModePrompt(mode.id), getModeHint(mode, model, reasoning, engine, tfDir));
 
     if (input === "/exit" || input === "/quit") break;
 
@@ -331,10 +394,13 @@ export async function runInteractiveSession(
     }
     if (input === "/switch" || input === "/s") {
       const picked = await pickSession();
-      mode = picked.mode; model = picked.model; reasoning = picked.reasoning; engine = picked.engine;
-      printKV("Mode",      c.bold(mode.label),      { keyWidth: 12 });
-      printKV("Reasoning", c.bold(reasoning.label), { keyWidth: 12 });
-      printKV("Model",     c.bold(model.label),      { keyWidth: 12 });
+      mode = picked.mode; model = picked.model; reasoning = picked.reasoning;
+      engine = picked.engine; tfDir = picked.tfDir;
+      printKV("Mode",      c.bold(mode.label),              { keyWidth: 12 });
+      if (IS_PLAN(mode.id)) printKV("Provider", c.bold(engine.label), { keyWidth: 12 });
+      if (tfDir)            printKV("TF dir",   c.dim(tfDir),         { keyWidth: 12 });
+      printKV("Reasoning", c.bold(reasoning.label),         { keyWidth: 12 });
+      printKV("Model",     c.bold(model.label),              { keyWidth: 12 });
       continue;
     }
 
@@ -347,7 +413,7 @@ export async function runInteractiveSession(
     const workflow  = makeWorkflowFn(tenant.awsRegion, model.id, telemetry);
 
     try {
-      await executeMode(workflow, mode.id, engine.id, reasoning.id, input, tenant);
+      await executeMode(workflow, mode.id, engine.id, reasoning.id, input, tenant, tfDir);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       console.log(`\n  ${c.red(sym.cross)} ${c.red("Error:")}  ${msg}`);
