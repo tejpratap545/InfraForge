@@ -17,6 +17,7 @@ import { executeTool, buildToolCatalog, ToolContext } from "../services/diagnose
 import { parseJsonPayload } from "../utils/llm";
 import { c, sym, Spinner, printBoxHeader, renderReport } from "../utils/terminal";
 import type { AwsCredentials } from "../types";
+import type { AwsMcpService } from "../services/awsMcpService";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -65,12 +66,13 @@ const TOOL_NAMES =
   "cw_metrics(namespace,metric,dimensions?,since_hours?,statistic?) | cw_logs(log_group,filter_pattern?,since_hours?) | " +
   "ecs_describe(cluster?,service?,task_id?) | elb_health(load_balancer?,target_group?) | " +
   "cloudtrail(event_name?,resource_name?,since_hours?) | asg_activity(asg_name?) | route53_check(domain?,zone_id?) | " +
-  "k8s_pods(namespace?,selector?) | k8s_events(namespace?,severity?,since?) | k8s_logs(pod,namespace?,grep?)\n" +
+  "k8s_pods(namespace?,selector?) | k8s_events(namespace?,severity?,since?) | k8s_logs(pod,namespace?,grep?) | " +
+  "aws_cli(command)  [any read-only AWS CLI cmd — xray, guardduty, health, config, ecr, secretsmanager, ssm params, etc.]\n" +
   "Parallel: {\"calls\":[{\"tool\":\"...\",\"params\":{...}},{...}]}";
 
-function systemPrompt(question: string, awsRegion: string, steps: Step[]): string {
+function systemPrompt(question: string, awsRegion: string, steps: Step[], mcpTools?: { name: string; params: string[]; description: string }[]): string {
   const history = compressHistory(steps);
-  const toolSection = steps.length === 0 ? buildToolCatalog() : TOOL_NAMES;
+  const toolSection = steps.length === 0 ? buildToolCatalog(mcpTools) : TOOL_NAMES;
 
   return `You are an expert AWS cloud analyst. Answer the user's question by querying live AWS data.
 Think like a cloud architect: pick the most relevant data source, fetch just enough to answer accurately.
@@ -97,6 +99,8 @@ RULES:
 - Fetch in parallel when multiple independent data sources are needed.
 - Conclude as soon as you have enough to answer — don't over-query.
 - answer must be specific: include names, IDs, counts, metric values from the actual data.
+- NO DATAPOINTS → run aws_cli("aws cloudwatch list-metrics --namespace <ns> --dimensions Name=<dim>,Value=<val> --region <r>") BEFORE retrying cw_metrics. Use the exact names from that output.
+- CLUSTER TYPE UNKNOWN → check ElastiCache AND ECS in parallel: aws_cli("aws elasticache describe-replication-groups --replication-group-id <name>") + ecs_describe(cluster=<name>).
 
 QUESTION : ${question}
 REGION   : ${awsRegion}
@@ -111,14 +115,35 @@ Your next action:`;
 // ─── Agent ────────────────────────────────────────────────────────────────────
 
 export class AskAgent {
-  constructor(private readonly bedrock: BedrockService) {}
+  constructor(
+    private readonly bedrock: BedrockService,
+    private readonly mcpService?: AwsMcpService,
+  ) {}
 
   async run(question: string, awsRegion: string, k8sContext?: string, credentials?: AwsCredentials): Promise<string> {
     console.log("");
     printBoxHeader(`Asking · ${question.slice(0, 60)}`);
     console.log("");
 
-    const ctx: ToolContext = { awsRegion, k8sContext, awsCredentials: credentials };
+    // ── Connect MCP servers (non-blocking, same pattern as DiagnoseAgent) ──────
+    if (this.mcpService && !this.mcpService.isConnected()) {
+      const sp = new Spinner().start("Connecting to AWS MCP servers…");
+      const ok = await this.mcpService.connect();
+      if (ok) {
+        const servers = this.mcpService.getConnectedServers();
+        const count   = this.mcpService.getDiscoveredTools().length;
+        sp.succeed(
+          `AWS MCP  ${c.dim("·")}  ${c.bold(servers.join(", "))}  ` +
+          `${c.dim(`·  ${count} tool${count !== 1 ? "s" : ""} available`)}`,
+        );
+      } else {
+        sp.fail(c.dim("AWS MCP not connected — using SDK tools only"));
+      }
+      console.log("");
+    }
+
+    const mcpTools = this.mcpService?.isConnected() ? this.mcpService.getDiscoveredTools() : undefined;
+    const ctx: ToolContext = { awsRegion, k8sContext, awsCredentials: credentials, mcpService: this.mcpService };
     const steps: Step[] = [];
     let finalAnswer = "";
     let stepNum = 0;
@@ -130,7 +155,7 @@ export class AskAgent {
       const sp = new Spinner().start(`Step ${stepNum}/${MAX_STEPS}  ·  thinking…`);
       let raw: string;
       try {
-        raw = await this.bedrock.complete(systemPrompt(question, awsRegion, steps), { maxTokens: STEP_MAX_TOKENS });
+        raw = await this.bedrock.complete(systemPrompt(question, awsRegion, steps, mcpTools), { maxTokens: STEP_MAX_TOKENS });
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
         sp.fail(`Step ${stepNum} — LLM error: ${errMsg}`);

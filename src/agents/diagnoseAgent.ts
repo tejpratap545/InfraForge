@@ -179,7 +179,12 @@ const COMPACT_TOOL_REF =
   "ecs_describe(cluster?,service?,task_id?) | elb_health(load_balancer?,target_group?) | " +
   "cloudtrail(event_name?,resource_name?,since_hours?) | asg_activity(asg_name?) | " +
   "route53_check(domain?,zone_id?) | " +
-  "k8s_pods(namespace?,selector?) | k8s_events(namespace?,severity?,since?) | k8s_logs(pod,namespace?,grep?,previous?)";
+  "k8s_pods(namespace?,selector?) | k8s_events(namespace?,severity?,since?) | k8s_logs(pod,namespace?,grep?,previous?) | " +
+  "aws_cli(command)  [any read-only AWS CLI cmd — use for elasticache, xray, guardduty, health, config, inspector, ecr, secretsmanager, ssm, etc.]\n" +
+  "  CLUSTER DISAMBIGUATION: 'cluster' could be ECS, EKS, or ElastiCache/Redis/Valkey.\n" +
+  "  → ECS cluster: ecs_describe(cluster=name)\n" +
+  "  → EKS cluster: k8s_pods / aws_cli(\"aws eks describe-cluster --name <name>\")\n" +
+  "  → ElastiCache/Redis/Valkey: aws_cli(\"aws elasticache describe-replication-groups --replication-group-id <name>\")";
 
 function buildCompactToolRef(mcpTools?: { name: string }[]): string {
   const base = `Tools: ${COMPACT_TOOL_REF}`;
@@ -263,6 +268,8 @@ TOOL SELECTION GUIDE:
   "Scaling issues"           → asg_activity + cw_metrics(CPU) + elb_health
   "Connection errors"        → cw_logs + route53_check + run_command(dig/curl)
   "Errors after deployment"  → ecs_describe + cloudtrail + cw_logs + elb_health
+  "Cache/Redis CPU or conn"  → aws_cli("aws elasticache describe-replication-groups") + cw_metrics(namespace=AWS/ElastiCache,dimensions=ReplicationGroupId=<name>)
+  "Unknown 'cluster' type"   → FIRST identify type: aws_cli("aws elasticache describe-replication-groups --replication-group-id <name>") AND ecs_describe(cluster=<name>) in parallel
 
 ═══ RULES ══════════════════════════════════════════════════════════════════════
 
@@ -282,6 +289,9 @@ TOOL SELECTION GUIDE:
    the evidence chain, and give specific remediation.
 10. ONE HYPOTHESIS AT A TIME — don't run 3 different theories in parallel. Pick the
     most likely one, test it, then pivot if disproved.
+11. NO DATAPOINTS → DISCOVER FIRST — if cw_metrics returns "No datapoints", run
+    aws_cli("aws cloudwatch list-metrics --namespace <same-ns> --dimensions Name=<dim>,Value=<val> --region <r>")
+    BEFORE retrying. Use the exact metric names and dimension values shown in that output.
 
 ═══ RESPONSE FORMAT — one valid JSON object, no markdown fences ════════════════
 

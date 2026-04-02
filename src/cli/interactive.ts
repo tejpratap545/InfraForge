@@ -1,6 +1,12 @@
 /**
  * Interactive session — arrow-key mode + model picker, then a persistent
  * run loop. Launched when `infra` is called with no subcommand.
+ *
+ * Slash commands available at the query prompt:
+ *   /mode   — re-pick investigation mode
+ *   /model  — re-pick LLM model
+ *   /switch — re-pick both
+ *   /exit   — quit
  */
 import * as readline from "node:readline";
 import { v4 as uuidv4 } from "uuid";
@@ -43,6 +49,8 @@ const REGIONS: MenuItem[] = [
   { id: "sa-east-1",      label: "sa-east-1",      desc: "South America — São Paulo" },
 ];
 
+export { REGIONS };
+
 const MODELS: MenuItem[] = [
   {
     id:    "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
@@ -67,6 +75,7 @@ const MODELS: MenuItem[] = [
 ];
 
 // ─── Arrow-key selection menu ────────────────────────────────────────────────
+// Returns null if the user pressed Escape or Backspace (go back).
 
 const LABEL_WIDTH = 18;
 
@@ -81,15 +90,15 @@ function renderMenuLines(prompt: string, items: MenuItem[], selected: number): s
     const label  = active
       ? c.bold(c.white(items[i].label.padEnd(LABEL_WIDTH)))
       : c.dim(items[i].label.padEnd(LABEL_WIDTH));
-    const desc = active ? c.dim(items[i].desc) : c.dim(items[i].desc);
+    const desc = c.dim(items[i].desc);
     lines.push(`    ${cursor}  ${label}  ${desc}`);
   }
   lines.push(""); // blank
-  lines.push(c.dim("  ↑↓  navigate    Enter  select    Ctrl+C  exit"));
+  lines.push(c.dim("  ↑↓  navigate    Enter  select    Esc/←  back    Ctrl+C  exit"));
   return lines;
 }
 
-async function selectMenu(prompt: string, items: MenuItem[]): Promise<MenuItem> {
+async function selectMenu(prompt: string, items: MenuItem[], canGoBack = false): Promise<MenuItem | null> {
   return new Promise((resolve, reject) => {
     let selected = 0;
 
@@ -105,7 +114,6 @@ async function selectMenu(prompt: string, items: MenuItem[]): Promise<MenuItem> 
 
     function redraw() {
       const newLines = renderMenuLines(prompt, items, selected);
-      // Move cursor up to the start of the menu block.
       process.stdout.write(`\x1b[${newLines.length}A`);
       for (const l of newLines) {
         process.stdout.write("\x1b[2K\x1b[0G" + l + "\n");
@@ -125,6 +133,15 @@ async function selectMenu(prompt: string, items: MenuItem[]): Promise<MenuItem> 
         process.stdout.write("\n");
         process.exit(0);
       }
+      // Escape or left-arrow or backspace = go back (if allowed).
+      if (key.name === "escape" || key.name === "left" || key.name === "backspace") {
+        if (canGoBack) {
+          cleanup();
+          process.stdout.write("\n");
+          resolve(null);
+        }
+        return;
+      }
       if (key.name === "up") {
         selected = (selected - 1 + items.length) % items.length;
         redraw();
@@ -133,7 +150,6 @@ async function selectMenu(prompt: string, items: MenuItem[]): Promise<MenuItem> 
         redraw();
       } else if (key.name === "return" || key.name === "enter") {
         cleanup();
-        // Print the confirmed selection and move on.
         process.stdout.write(
           `\n  ${c.green(sym.check)}  ${c.bold(items[selected].label)}  ${c.dim(items[selected].desc)}\n`,
         );
@@ -142,8 +158,6 @@ async function selectMenu(prompt: string, items: MenuItem[]): Promise<MenuItem> 
     }
 
     process.stdin.on("keypress", onKey);
-
-    // Safety: resolve on uncaught errors.
     process.stdin.once("error", reject);
   });
 }
@@ -161,8 +175,6 @@ async function textInput(prompt: string, hint?: string): Promise<string> {
       output: process.stdout,
       terminal: false,
     });
-    // Guard against the race: rl.close() emits "close" synchronously inside
-    // the "line" handler, before resolve(line) has a chance to run.
     let done = false;
     rl.once("line", (line) => {
       done = true;
@@ -204,40 +216,40 @@ function getModePrompt(modeId: string): string {
   }
 }
 
-function getModeHint(modeId: string): string | undefined {
-  switch (modeId) {
-    case "diagnose": return 'e.g. "why is mimir crashing?"  or  "payment service is throwing 503s"';
-    case "debug":    return 'e.g. checkout-api  ·  Advanced options available via  infra debug --help';
-    case "ask":      return 'e.g. "how many EC2 instances do I have in us-east-1?"';
-    case "create":   return 'e.g. "deploy an EKS cluster with 3 nodes in us-east-1"';
-    case "plan":     return 'e.g. "create an RDS PostgreSQL 15 instance"';
-    case "apply":    return 'e.g. "add a Lambda function with S3 trigger"';
-    default:         return undefined;
+function getModeHint(mode: MenuItem, model: MenuItem): string {
+  const switchHint = c.dim(`  /mode · /model · /switch to change    /exit to quit`);
+  const modeStatus = `${c.dim("mode:")} ${c.cyan(mode.label)}  ${c.dim("model:")} ${c.cyan(model.label)}`;
+
+  let example = "";
+  switch (mode.id) {
+    case "diagnose": example = 'e.g. "why is mimir crashing?"'; break;
+    case "debug":    example = 'e.g. checkout-api'; break;
+    case "ask":      example = 'e.g. "how many EC2 instances in us-east-1?"'; break;
+    case "create":   example = 'e.g. "deploy an EKS cluster with 3 nodes"'; break;
+    case "plan":     example = 'e.g. "create an RDS PostgreSQL 15 instance"'; break;
+    case "apply":    example = 'e.g. "add a Lambda function with S3 trigger"'; break;
   }
+
+  return `${modeStatus}   ${c.dim(example)}\n${switchHint}`;
 }
 
-// ─── Continue prompt ──────────────────────────────────────────────────────────
+// ─── Mode + model selection (with back-navigation support) ───────────────────
 
-async function promptContinue(): Promise<boolean> {
-  process.stdout.write(
-    `\n  ${c.dim("Press")} ${c.cyan("Enter")} ${c.dim("for a new query    ")}${c.dim("Ctrl+C")} ${c.dim("to exit")}\n\n  ${c.cyan("›")} `,
-  );
-  return new Promise((resolve) => {
-    const rl = readline.createInterface({ input: process.stdin, terminal: false });
-    let done = false;
-    rl.once("line", () => {
-      done = true;
-      rl.close();
-      process.stdin.resume();
-      resolve(true);
-    });
-    rl.once("close", () => {
-      if (!done) {
-        process.stdin.resume();
-        resolve(false);
-      }
-    });
-  });
+async function pickModeAndModel(): Promise<{ mode: MenuItem; model: MenuItem }> {
+  // Loop until both mode and model are confirmed.
+  // Pressing back on model returns to mode selection.
+  // Pressing back on mode has nowhere to go — ignored.
+  while (true) {
+    const mode = await selectMenu("Mode", MODES, false);
+    if (!mode) continue; // can't go back further than mode
+
+    while (true) {
+      const model = await selectMenu("Model", MODELS, true);
+      if (!model) break; // go back to mode selection
+
+      return { mode, model };
+    }
+  }
 }
 
 // ─── Session header ───────────────────────────────────────────────────────────
@@ -261,9 +273,7 @@ export async function runInteractiveSession(
 ): Promise<void> {
   printSessionHeader(tenant);
 
-  // Keep the user's chosen mode/model for the whole interactive session.
-  const mode = await selectMenu("Mode", MODES);
-  const model = await selectMenu("Model", MODELS);
+  let { mode, model } = await pickModeAndModel();
 
   console.log("");
   printKV("Mode",  c.bold(mode.label),  { keyWidth: 8 });
@@ -271,8 +281,38 @@ export async function runInteractiveSession(
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
-    // 1. Input.
-    const input = await textInput(getModePrompt(mode.id), getModeHint(mode.id));
+    // 1. Input — show current mode/model and slash-command hints.
+    const input = await textInput(getModePrompt(mode.id), getModeHint(mode, model));
+
+    // Slash commands to switch mode / model mid-session.
+    if (input === "/exit" || input === "/quit") {
+      break;
+    }
+    if (input === "/mode" || input === "/m") {
+      const picked = await selectMenu("Mode", MODES, false);
+      if (picked) {
+        mode = picked;
+        printKV("Mode", c.bold(mode.label), { keyWidth: 8 });
+      }
+      continue;
+    }
+    if (input === "/model" || input === "/llm") {
+      const picked = await selectMenu("Model", MODELS, true);
+      if (picked) {
+        model = picked;
+        printKV("Model", c.bold(model.label), { keyWidth: 8 });
+      }
+      continue;
+    }
+    if (input === "/switch" || input === "/s") {
+      const picked = await pickModeAndModel();
+      mode  = picked.mode;
+      model = picked.model;
+      printKV("Mode",  c.bold(mode.label),  { keyWidth: 8 });
+      printKV("Model", c.bold(model.label), { keyWidth: 8 });
+      continue;
+    }
+
     if (!input) {
       console.log(c.dim("  (empty input — waiting for another query)\n"));
       continue;
@@ -289,12 +329,11 @@ export async function runInteractiveSession(
       console.log(`\n  ${c.red(sym.cross)} ${c.red("Error:")}  ${msg}`);
     }
 
-    // 3. Telemetry panel.
-    printTelemetry(telemetry, mode.label, model.label);
+    // Show question recap so it's visible next to the answer before telemetry.
+    console.log(`\n  ${c.dim("Q:")}  ${c.bold(input)}`);
 
-    // 4. Loop.
-    const again = await promptContinue();
-    if (!again) break;
+    // 3. Telemetry panel — then loop straight back to input (no extra Enter needed).
+    printTelemetry(telemetry, mode.label, model.label);
     console.log("");
   }
 

@@ -1,3 +1,6 @@
+import { appendFileSync, mkdirSync, readFileSync, existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { ClarifyAgent } from "../agents/clarifyAgent";
 import { PlannerAgent } from "../agents/plannerAgent";
 import { AwsPlannerAgent } from "../agents/awsPlannerAgent";
@@ -391,6 +394,16 @@ export class InfraWorkflow {
 
     const answer = await this.askAgent.run(question, tenant.awsRegion, undefined, tenant.awsCredentials);
     if (answer) console.log(answer);
+
+    // ── Persist Q&A to history file ──────────────────────────────────────────
+    if (answer) {
+      try {
+        const dir = join(homedir(), ".infra-copilot");
+        mkdirSync(dir, { recursive: true });
+        const entry = JSON.stringify({ ts: new Date().toISOString(), question, answer }) + "\n";
+        appendFileSync(join(dir, "history.jsonl"), entry, "utf8");
+      } catch { /* never block on history write errors */ }
+    }
 
     this.tracing.log(trace, "Ask workflow completed", { latencyMs: Date.now() - startedAt, question });
   }

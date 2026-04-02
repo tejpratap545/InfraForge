@@ -42,8 +42,8 @@ function makeWorkflow(
   const awsPlannerAgent = new AwsPlannerAgent(bedrock);
   const terraformMcp = new TerraformMcpService(cwd());
   const executorAgent = new ExecutorAgent(terraformMcp);
-  const askAgent = new AskAgent(bedrock);
   const awsMcp = new AwsMcpService();
+  const askAgent = new AskAgent(bedrock, awsMcp);
   const diagnoseAgent = new DiagnoseAgent(bedrock, awsMcp);
   const registryClient = new TerraformRegistryClient();
   return new InfraWorkflow(

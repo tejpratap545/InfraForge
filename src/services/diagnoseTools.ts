@@ -121,7 +121,7 @@ const BLOCKED: RegExp[] = [
   /\brm\s+-[rf]/i,
   /\bformat\b/i,
   /\bfdisk\b/i,
-  /^\s*aws\s+/i,           // AWS CLI — use SDK tools instead
+  // AWS CLI is allowed via aws_cli() tool — not here in run_command
   /kubectl\s+delete\b/i,
   /kubectl\s+apply\b/i,
   /kubectl\s+patch\b/i,
@@ -158,7 +158,7 @@ export async function run_command(
   if (!cmd) return "ERROR: command param is required";
   if (!isSafe(cmd)) {
     if (/^\s*aws\s+/i.test(cmd)) {
-      return `BLOCKED: use SDK tools instead of AWS CLI — aws_query, aws_get, ecs_describe, elb_health, cloudtrail, cw_metrics, cw_logs, etc.`;
+      return `Use the aws_cli tool for AWS CLI commands — it injects credentials and enforces read-only safety.`;
     }
     return `BLOCKED: command matches safety blocklist — "${cmd}"`;
   }
@@ -379,7 +379,12 @@ export async function cw_metrics(
       .sort((a, b) => (a.Timestamp?.getTime() ?? 0) - (b.Timestamp?.getTime() ?? 0));
 
     if (points.length === 0) {
-      return `No datapoints for ${namespace}/${metric} (dims=${dimensions ?? "none"}) last ${sinceHours}h in ${r}. Check metric name, namespace, and dimensions are correct.`;
+      return (
+        `No datapoints for ${namespace}/${metric} (dims=${dimensions ?? "none"}) last ${sinceHours}h in ${r}.\n` +
+        `Run this to verify what metrics actually exist:\n` +
+        `  aws cloudwatch list-metrics --namespace ${namespace}${dims.length > 0 ? ` --dimensions Name=${dims[0].Name},Value=${dims[0].Value}` : ""} --region ${r}\n` +
+        `Then retry cw_metrics with the exact dimension names/values shown above.`
+      );
     }
 
     // Detect unit from first datapoint
@@ -1130,7 +1135,112 @@ export async function k8s_logs(
   return `Logs: pod=${pod} ns=${namespace}${container ? " container=" + container : ""} last ${since}${grep ? ` grep="${grep}"` : ""}${previous ? " (previous)" : ""}:\n${raw}`;
 }
 
-// ─── Tool 16: mcp_tool ──────────────────────────────────────────────────────
+// ─── Tool 16: aws_cli ────────────────────────────────────────────────────────
+
+/**
+ * Run a read-only AWS CLI command with credential injection from context.
+ *
+ * Why this exists alongside SDK tools:
+ *   - SDK tools cover ~15 key APIs with structured output
+ *   - AWS CLI covers ALL 300+ AWS services (xray, health, guardduty, config,
+ *     securityhub, inspector, servicediscovery, support, pricing, ce, etc.)
+ *   - Some APIs are awkward to use via SDK but trivial via CLI
+ *     (e.g. "aws logs tail", "aws xray get-trace-summaries", "aws health describe-events")
+ *
+ * Safety: only read-only subcommands allowed (describe, list, get, query, show,
+ * tail, filter, search, export, view, check, scan, find, lookup, fetch).
+ * Any mutating verb is blocked.
+ *
+ * Credentials from ctx.awsCredentials are injected as env vars so the CLI
+ * uses the tenant account even if ~/.aws/credentials points elsewhere.
+ */
+export async function aws_cli(
+  params: Record<string, string>,
+  ctx: ToolContext,
+): Promise<string> {
+  let command = params["command"]?.trim() ?? "";
+  if (!command) return "ERROR: command param is required (e.g. \"aws elasticache describe-replication-groups --replication-group-id <name>\")";
+
+  // Sanitize: strip surrounding quotes/backticks the LLM sometimes adds
+  command = command.replace(/^[`"']+|[`"']+$/g, "").trim();
+  // Collapse newlines and multiple spaces into single spaces
+  command = command.replace(/[\r\n]+/g, " ").replace(/\s{2,}/g, " ").trim();
+
+  // Must start with "aws"
+  if (!/^\s*aws\s+/.test(command)) {
+    return `ERROR: command must start with "aws" (e.g. "aws ecs describe-services ...")`;
+  }
+
+  // Read-only allowlist — only these subcommand verbs are permitted
+  const READ_ONLY_VERBS = [
+    "describe", "list", "get", "query", "show", "tail",
+    "filter", "search", "export", "view", "check", "scan",
+    "find", "lookup", "fetch", "summarize", "analyze", "validate",
+  ];
+
+  // Extract the subcommand (3rd word: "aws <service> <subcommand>")
+  const parts = command.trim().split(/\s+/);
+  const subcommand = parts[2]?.toLowerCase() ?? "";
+
+  const isReadOnly = READ_ONLY_VERBS.some((v) => subcommand.startsWith(v));
+  if (!isReadOnly) {
+    return (
+      `BLOCKED: "${subcommand}" is not a read-only subcommand.\n` +
+      `Allowed verbs: ${READ_ONLY_VERBS.join(", ")}.\n` +
+      `Examples: describe-services, list-clusters, get-trace-summaries, list-findings`
+    );
+  }
+
+  // Ensure --output json unless user specified something else
+  const finalCmd = command.includes("--output") ? command : `${command} --output json`;
+
+  // Inject region if not already specified
+  const withRegion = (finalCmd.includes("--region") || finalCmd.includes("global"))
+    ? finalCmd
+    : `${finalCmd} --region ${ctx.awsRegion}`;
+
+  // Build env with tenant credentials injected — overrides ~/.aws/credentials
+  const env: Record<string, string> = { ...process.env as Record<string, string> };
+  if (ctx.awsCredentials) {
+    env["AWS_ACCESS_KEY_ID"]     = ctx.awsCredentials.accessKeyId;
+    env["AWS_SECRET_ACCESS_KEY"] = ctx.awsCredentials.secretAccessKey;
+    if (ctx.awsCredentials.sessionToken) {
+      env["AWS_SESSION_TOKEN"] = ctx.awsCredentials.sessionToken;
+    }
+    // Clear profile so explicit creds take precedence
+    delete env["AWS_PROFILE"];
+    delete env["AWS_DEFAULT_PROFILE"];
+  }
+
+  return new Promise((resolve) => {
+    exec(withRegion, { timeout: 30_000, env }, (_err, stdout, stderr) => {
+      // AWS CLI writes errors to stderr. Always resolve — errors are evidence for the LLM.
+      const out = stdout?.trim();
+      const err = stderr?.trim();
+
+      if (out && out.length > 0) {
+        // Pretty-print JSON if possible
+        try {
+          const parsed = JSON.parse(out);
+          // JSON.parse("null") returns JS null — not useful, treat as no output
+          if (parsed === null || parsed === undefined) {
+            resolve(err ? `AWS CLI ERROR: ${err.slice(0, 2_000)}` : "(command returned empty/null response)");
+          } else {
+            resolve(JSON.stringify(parsed, null, 2).slice(0, 8_000));
+          }
+        } catch {
+          resolve(out.slice(0, 8_000));
+        }
+      } else if (err) {
+        resolve(`AWS CLI ERROR (cmd: ${withRegion.slice(0, 200)}): ${err.slice(0, 2_000)}`);
+      } else {
+        resolve("(no output)");
+      }
+    });
+  });
+}
+
+// ─── Tool 17: mcp_tool ──────────────────────────────────────────────────────
 
 export async function mcp_tool(
   params: Record<string, string>,
@@ -1233,20 +1343,46 @@ export function buildToolCatalog(mcpTools?: AwsMcpTool[]): string {
     involved_object = filter by resource name.
 
 15. k8s_logs(pod: string, namespace?: string, container?: string, since?: string, grep?: string, tail?: string, previous?: string)
-    Pod logs with optional grep filtering. previous="true" for crashed container logs.`;
+    Pod logs with optional grep filtering. previous="true" for crashed container logs.
+
+16. aws_cli(command: string)
+    Run any read-only AWS CLI command. Credentials injected from context automatically.
+    Only read-only subcommands allowed: describe, list, get, query, filter, search, tail, scan, lookup, analyze.
+    Output is always --output json, region injected automatically.
+    Use for services NOT covered by SDK tools: ElastiCache, X-Ray, GuardDuty, Security Hub,
+    AWS Health, AWS Config, Inspector, Service Discovery, Support, Pricing, Trusted Advisor,
+    WAF, Shield, CloudFormation events, ECR image scans, Secrets Manager, Parameter Store, etc.
+    ElastiCache/Redis/Valkey (IMPORTANT — "cluster" may be ElastiCache, not ECS!):
+      "aws elasticache describe-replication-groups --replication-group-id <name>"
+      "aws elasticache describe-cache-clusters --cache-cluster-id <name> --show-cache-node-info"
+      "aws elasticache describe-events --source-type replication-group --duration 60"
+    Other examples:
+      "aws xray get-trace-summaries --time-range-type EventTime --start-time 2026-04-02T10:00:00Z --end-time 2026-04-02T11:00:00Z"
+      "aws health describe-events --filter eventStatusCodes=open"
+      "aws guardduty list-findings --detector-id <id>"
+      "aws configservice describe-compliance-by-resource --resource-type AWS::ECS::Service"
+      "aws secretsmanager describe-secret --secret-id my-secret"
+      "aws ssm get-parameter --name /my/param --with-decryption"
+      "aws ecr describe-image-scan-findings --repository-name my-repo --image-id imageTag=latest"
+      "aws logs tail /ecs/my-service --since 1h"
+    Metric discovery (use when cw_metrics returns no datapoints):
+      "aws cloudwatch list-metrics --namespace AWS/ElastiCache --dimensions Name=CacheClusterId,Value=<id>"
+      "aws cloudwatch list-metrics --namespace AWS/ECS --dimensions Name=ClusterName,Value=<name>"
+      "aws cloudwatch list-metrics --namespace AWS/ApplicationELB"
+    This shows exactly what metrics + dimensions CloudWatch is publishing — fixes wrong dimension guesses.`;
 
   if (!mcpTools || mcpTools.length === 0) return base;
 
   const mcpSection = mcpTools
     .map((t, i) => {
       const paramList = t.params.length > 0 ? `(${t.params.join(", ")})` : "()";
-      return `${16 + i}. mcp_tool  name="${t.name}"${paramList}\n   ${t.description}`;
+      return `${17 + i}. mcp_tool  name="${t.name}"${paramList}\n   ${t.description}`;
     })
     .join("\n\n");
 
   return (
     base +
-    `\n\n16+. mcp_tool(name: string, ...args)  [AWS MCP SERVER — prefer these over SDK tools when available]\n` +
+    `\n\n17+. mcp_tool(name: string, ...args)  [AWS MCP SERVER — prefer these over SDK tools when available]\n` +
     `   Call any AWS MCP server tool directly. Pass name= plus the tool's own parameters.\n` +
     `   Example: {"tool":"mcp_tool","params":{"name":"list_load_balancers","region":"ap-southeast-1"}}\n\n` +
     `   Available MCP tools:\n` +
@@ -1278,6 +1414,7 @@ export async function executeTool(
     case "k8s_pods":          return k8s_pods(params, ctx);
     case "k8s_events":        return k8s_events(params, ctx);
     case "k8s_logs":          return k8s_logs(params, ctx);
+    case "aws_cli":           return aws_cli(params, ctx);
     case "mcp_tool":          return mcp_tool(params, ctx);
     default: {
       // Auto-route MCP tool names
@@ -1285,7 +1422,7 @@ export async function executeTool(
         const known = ctx.mcpService.getDiscoveredTools().some((t) => t.name === name);
         if (known) return mcp_tool({ name, ...params }, ctx);
       }
-      return `ERROR: Unknown tool "${name}". Available: run_command, aws_query, aws_get, ec2_exec, cw_metrics, cw_logs, pi_top_sql, ecs_describe, elb_health, cloudtrail, asg_activity, route53_check, k8s_pods, k8s_events, k8s_logs, mcp_tool`;
+      return `ERROR: Unknown tool "${name}". Available: run_command, aws_query, aws_get, ec2_exec, cw_metrics, cw_logs, pi_top_sql, ecs_describe, elb_health, cloudtrail, asg_activity, route53_check, k8s_pods, k8s_events, k8s_logs, aws_cli, mcp_tool`;
     }
   }
 }
