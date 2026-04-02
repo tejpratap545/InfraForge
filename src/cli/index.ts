@@ -9,6 +9,7 @@ import { DiagnoseAgent } from "../agents/diagnoseAgent";
 import { AskAgent } from "../agents/askAgent";
 import { BedrockService } from "../services/bedrockService";
 import { TerraformMcpService } from "../services/terraformMcpService";
+import { AwsMcpService } from "../services/awsMcpService";
 import { TerraformRegistryClient } from "../services/terraformRegistryClient";
 import { RateLimiterService } from "../services/rateLimiterService";
 import { SubscriptionService } from "../services/subscriptionService";
@@ -42,7 +43,8 @@ function makeWorkflow(
   const terraformMcp = new TerraformMcpService(cwd());
   const executorAgent = new ExecutorAgent(terraformMcp);
   const askAgent = new AskAgent(bedrock);
-  const diagnoseAgent = new DiagnoseAgent(bedrock);
+  const awsMcp = new AwsMcpService();
+  const diagnoseAgent = new DiagnoseAgent(bedrock, awsMcp);
   const registryClient = new TerraformRegistryClient();
   return new InfraWorkflow(
     clarifyAgent,

@@ -16,6 +16,7 @@ import { exec } from "node:child_process";
 import {
   CloudControlClient,
   ListResourcesCommand,
+  ListResourcesCommandOutput,
   GetResourceCommand,
 } from "@aws-sdk/client-cloudcontrol";
 import {
@@ -30,6 +31,7 @@ import {
   DescribeLogGroupsCommand,
 } from "@aws-sdk/client-cloudwatch-logs";
 import type { AwsCredentials } from "../types";
+import type { AwsMcpService, AwsMcpTool } from "./awsMcpService";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -38,6 +40,8 @@ export interface ToolContext {
   k8sContext?: string;
   /** Explicit AWS credentials. Falls back to SDK default chain if omitted. */
   awsCredentials?: AwsCredentials;
+  /** Connected AWS MCP service instance. Undefined if MCP is not configured. */
+  mcpService?: AwsMcpService;
 }
 
 // ─── Safety blocklist for run_command ────────────────────────────────────────
@@ -127,13 +131,90 @@ export async function aws_query(
   const r          = params["region"]?.trim() || ctx.awsRegion;
   const maxResults  = Math.min(parseInt(params["max_results"] ?? "20", 10), 50);
   // Optional ResourceModel filter — JSON string scoping the list (e.g. '{"VpcId":"vpc-0abc"}')
-  const filter      = params["filter"]?.trim() || undefined;
+  // LLM may pass filter as an object, a valid JSON string, or a "Key=Value" string.
+  // AWS Cloud Control requires a valid JSON object string — normalise all forms.
+  const rawFilter = params["filter"];
+  let filter: string | undefined;
+  if (rawFilter == null || rawFilter === "") {
+    filter = undefined;
+  } else if (typeof rawFilter === "object") {
+    filter = JSON.stringify(rawFilter) || undefined;
+  } else {
+    const s = String(rawFilter).trim();
+    if (!s) {
+      filter = undefined;
+    } else if (s.startsWith("{")) {
+      // Already a JSON object string — validate it, drop if malformed
+      try { JSON.parse(s); filter = s; } catch { filter = undefined; }
+    } else if (s.includes("=")) {
+      // "Key=Value,Key2=Value2" → {"Key":"Value","Key2":"Value2"}
+      const obj: Record<string, string> = {};
+      s.split(",").forEach((kv) => {
+        const eq = kv.indexOf("=");
+        if (eq > 0) obj[kv.slice(0, eq).trim()] = kv.slice(eq + 1).trim();
+      });
+      filter = Object.keys(obj).length ? JSON.stringify(obj) : undefined;
+    } else {
+      filter = undefined;
+    }
+  }
+
+  // Optional: client-side substring filter applied to identifier + properties JSON.
+  // When set, auto-paginates all pages (up to 10) to find matching items.
+  const nameFilter = params["name_filter"]?.trim().toLowerCase() || undefined;
+
+  // Optional: resume token from a previous aws_query call (for manual pagination).
+  const nextTokenIn = params["next_token"]?.trim() || undefined;
 
   const client = new CloudControlClient({ region: r, ...(ctx.awsCredentials && { credentials: ctx.awsCredentials }) });
 
+  function formatItem(item: { Identifier?: string; Properties?: string }): string {
+    const id = item.Identifier ?? "?";
+    let props = "";
+    try {
+      props = item.Properties ? JSON.stringify(JSON.parse(item.Properties)) : "";
+    } catch {
+      props = item.Properties ?? "";
+    }
+    return `${id}  ${props.slice(0, 400)}`;
+  }
+
   try {
+    if (nameFilter) {
+      // Auto-paginate up to 10 pages, collecting items that match the filter.
+      const matched: string[] = [];
+      let token: string | undefined;
+      let pages = 0;
+      const pageSize = 50; // max per page to minimise round-trips
+
+      while (pages < 10) {
+        const res: ListResourcesCommandOutput = await client.send(
+          new ListResourcesCommand({ TypeName: typeName, MaxResults: pageSize, ResourceModel: filter, NextToken: token }),
+        );
+        pages++;
+
+        for (const item of res.ResourceDescriptions ?? []) {
+          const id    = item.Identifier ?? "";
+          const props = item.Properties ?? "";
+          if (id.toLowerCase().includes(nameFilter) || props.toLowerCase().includes(nameFilter)) {
+            matched.push(formatItem(item));
+          }
+        }
+
+        token = res.NextToken;
+        if (!token) break;
+        if (matched.length >= maxResults) break; // enough results, stop early
+      }
+
+      if (matched.length === 0) {
+        return `No ${typeName} matched name_filter="${nameFilter}" after scanning ${pages} page(s) in ${r}`;
+      }
+      return `${typeName} matching "${nameFilter}" in ${r} (${matched.length} found, scanned ${pages} page(s)):\n` + matched.join("\n");
+    }
+
+    // Single-page list (with optional manual pagination token).
     const res = await client.send(
-      new ListResourcesCommand({ TypeName: typeName, MaxResults: maxResults, ResourceModel: filter }),
+      new ListResourcesCommand({ TypeName: typeName, MaxResults: maxResults, ResourceModel: filter, NextToken: nextTokenIn }),
     );
 
     const items = res.ResourceDescriptions ?? [];
@@ -141,22 +222,11 @@ export async function aws_query(
       return `No resources found for ${typeName} in region ${r}`;
     }
 
-    const lines = items.map((item) => {
-      const id = item.Identifier ?? "?";
-      // Parse properties and show as compact JSON (single line, trimmed)
-      let props = "";
-      try {
-        props = item.Properties ? JSON.stringify(JSON.parse(item.Properties)) : "";
-      } catch {
-        props = item.Properties ?? "";
-      }
-      return `${id}  ${props.slice(0, 400)}`;
-    });
-
-    return `${typeName} in ${r} (${items.length} found):\n` + lines.join("\n");
+    const lines = items.map(formatItem);
+    const more = res.NextToken ? `\nnext_token=${res.NextToken}  (pass to aws_query to get next page)` : "";
+    return `${typeName} in ${r} (${items.length} found):\n` + lines.join("\n") + more;
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    // Many types aren't supported by Cloud Control — suggest aws CLI fallback
     if (msg.includes("not supported") || msg.includes("TypeNotFoundException") || msg.includes("UnsupportedAction")) {
       return `Cloud Control does not support listing ${typeName}. Try aws_get with a known identifier, or use a related type.`;
     }
@@ -229,13 +299,26 @@ export async function cw_metrics(
 ): Promise<string> {
   const namespace  = params["namespace"]?.trim();
   const metric     = params["metric"]?.trim();
-  // LLM may pass dimensions as an object {"InstanceId":"i-0abc"} — normalise to "Key=Value" string
+  // LLM may pass dimensions as:
+  //   "Key=Value"                          → plain string, use as-is
+  //   {"Key":"Value"}                      → flat object, entries → "Key=Value"
+  //   [{"Name":"Key","Value":"Value"},…]   → AWS SDK shape, map to "Key=Value"
   const rawDims = params["dimensions"];
-  const dimensions = rawDims == null
-    ? undefined
-    : typeof rawDims === "object"
-      ? Object.entries(rawDims as Record<string, string>).map(([k, v]) => `${k}=${v}`).join(",")
-      : String(rawDims).trim();
+  let dimensions: string | undefined;
+  if (rawDims == null) {
+    dimensions = undefined;
+  } else if (Array.isArray(rawDims)) {
+    dimensions = (rawDims as Array<Record<string, string>>)
+      .map((d) => (d.Name && d.Value ? `${d.Name}=${d.Value}` : ""))
+      .filter(Boolean)
+      .join(",") || undefined;
+  } else if (typeof rawDims === "object") {
+    dimensions = Object.entries(rawDims as Record<string, string>)
+      .map(([k, v]) => `${k}=${v}`)
+      .join(",") || undefined;
+  } else {
+    dimensions = String(rawDims).trim() || undefined;
+  }
   if (!namespace) return "ERROR: namespace param required (e.g. AWS/EC2)";
   if (!metric)    return "ERROR: metric param required (e.g. CPUUtilization)";
 
@@ -436,29 +519,84 @@ export async function ec2_exec(
 
 // ─── Tool catalog (shown to LLM in every prompt) ─────────────────────────────
 
-export function buildToolCatalog(): string {
-  return `TOOLS:
+/**
+ * Build the tool catalog string shown to the LLM on the first investigation step.
+ * When an AWS MCP server is connected, discovered tools are appended so the LLM
+ * knows it can call richer, purpose-built AWS APIs through mcp_tool().
+ */
+export function buildToolCatalog(mcpTools?: AwsMcpTool[]): string {
+  const base = `TOOLS:
 
 1. run_command(command: string)
    Execute any read-only shell command. k8s context auto-injected for kubectl/helm.
    Use for: kubectl, helm, dig, nslookup, curl, nc, ping, openssl, ssh, traceroute.
    Do NOT use for AWS — use the SDK tools below instead.
 
-2. aws_query(type: string, region?: string, max_results?: string, filter?: string)
+2. aws_query(type: string, region?: string, max_results?: string, filter?: string, name_filter?: string)
    List AWS resources by CloudFormation type via Cloud Control SDK (no CLI needed).
    filter: optional JSON ResourceModel string to scope results, e.g. '{"VpcId":"vpc-0abc"}'.
+   name_filter: substring to match against identifier + properties — auto-paginates ALL pages (e.g. name_filter="qa-cms-host-alb").
 
 3. aws_get(type: string, identifier: string, region?: string)
-   Fetch full properties of one AWS resource via Cloud Control SDK. identifier must be a real resource ID from aws_query.
+   Fetch full properties of one AWS resource. identifier must be a real resource ID from aws_query.
 
 4. ec2_exec(instance_id: string, command: string, region?: string)
    Run a command inside an EC2 instance via SSM (no SSH key needed).
 
 5. cw_metrics(namespace: string, metric: string, dimensions?: string, since_hours?: string, period_minutes?: string, statistic?: string, region?: string)
    Fetch CloudWatch metric statistics. dimensions format: "Key=Value" or "Key1=V1,Key2=V2".
+   ALB: namespace=AWS/ApplicationELB, dimension LoadBalancer=app/<name>/<hash> (ARN suffix after "loadbalancer/").
+   Common ALB metrics: HTTPCode_Target_4XX_Count, HTTPCode_Target_5XX_Count, HTTPCode_ELB_5XX_Count, RequestCount, TargetResponseTime. Use statistic=Sum for error counts.
 
 6. cw_logs(log_group: string, filter_pattern?: string, since_hours?: string, limit?: string, region?: string)
    Search CloudWatch Logs. log_group can be a full name or prefix.`;
+
+  if (!mcpTools || mcpTools.length === 0) return base;
+
+  const mcpSection = mcpTools
+    .map((t, i) => {
+      const paramList = t.params.length > 0 ? `(${t.params.join(", ")})` : "()";
+      return `${7 + i}. mcp_tool  name="${t.name}"${paramList}\n   ${t.description}`;
+    })
+    .join("\n\n");
+
+  return (
+    base +
+    `\n\n7+. mcp_tool(name: string, ...args)  [AWS MCP SERVER — prefer these over SDK tools when available]\n` +
+    `   Call any AWS MCP server tool directly. Pass name= plus the tool's own parameters.\n` +
+    `   Example: {"tool":"mcp_tool","params":{"name":"list_load_balancers","region":"ap-southeast-1"}}\n\n` +
+    `   Available MCP tools:\n` +
+    mcpSection
+  );
+}
+
+// ─── Tool 7: mcp_tool ─────────────────────────────────────────────────────────
+
+/**
+ * Route a call to any tool advertised by the connected AWS MCP server.
+ * The LLM passes name= (the MCP tool name) plus the tool's own parameters.
+ * Falls back with a clear error if MCP is not configured or not connected.
+ *
+ * Example params: { name: "list_load_balancers", region: "ap-southeast-1" }
+ */
+export async function mcp_tool(
+  params: Record<string, string>,
+  ctx: ToolContext,
+): Promise<string> {
+  const toolName = params["name"]?.trim();
+  if (!toolName) {
+    return `ERROR: name param required — specify the MCP tool to call (e.g. name="list_load_balancers")`;
+  }
+  if (!ctx.mcpService?.isConnected()) {
+    return (
+      `ERROR: AWS MCP server not connected. ` +
+      `Configure with AWS_MCP_URL=http://<host>/mcp or AWS_MCP_TRANSPORT=stdio + AWS_MCP_COMMAND.`
+    );
+  }
+
+  // Strip "name" key; pass the rest as args to the MCP tool.
+  const { name: _name, ...rest } = params;
+  return ctx.mcpService.callTool(toolName, rest as Record<string, unknown>);
 }
 
 // ─── Dispatcher ───────────────────────────────────────────────────────────────
@@ -475,7 +613,16 @@ export async function executeTool(
     case "ec2_exec":    return ec2_exec(params, ctx);
     case "cw_metrics":  return cw_metrics(params, ctx);
     case "cw_logs":     return cw_logs(params, ctx);
-    default:
-      return `ERROR: Unknown tool "${name}". Available: run_command, aws_query, aws_get, ec2_exec, cw_metrics, cw_logs`;
+    case "mcp_tool":    return mcp_tool(params, ctx);
+    default: {
+      // Auto-route: if the LLM calls an MCP tool by its bare name (e.g.
+      // "get_active_alarms" instead of mcp_tool with name="get_active_alarms"),
+      // detect it and route transparently so the call still succeeds.
+      if (ctx.mcpService?.isConnected()) {
+        const known = ctx.mcpService.getDiscoveredTools().some((t) => t.name === name);
+        if (known) return mcp_tool({ name, ...params }, ctx);
+      }
+      return `ERROR: Unknown tool "${name}". Available: run_command, aws_query, aws_get, ec2_exec, cw_metrics, cw_logs, mcp_tool`;
+    }
   }
 }

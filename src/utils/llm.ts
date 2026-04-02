@@ -8,13 +8,26 @@
  */
 export function extractJsonPayload(response: string): string {
   const trimmed = response.trim();
-  if (!trimmed.startsWith("```")) return trimmed;
-  // Remove opening fence (```json or ```)
-  const withoutOpen = trimmed.replace(/^```(?:json)?\s*/i, "");
-  // Remove everything from the last closing fence onward
-  const lastFence = withoutOpen.lastIndexOf("```");
-  if (lastFence !== -1) return withoutOpen.slice(0, lastFence).trim();
-  return withoutOpen.trim();
+
+  // Fast path: already bare JSON.
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) return trimmed;
+
+  // Strip an opening code fence (```json or ```).
+  if (trimmed.startsWith("```")) {
+    const withoutOpen = trimmed.replace(/^```(?:json)?\s*/i, "");
+    // Find the FIRST closing fence that appears AFTER the opening brace,
+    // so backtick sequences inside JSON string values don't trip the parser.
+    const bracePos = withoutOpen.indexOf("{");
+    if (bracePos === -1) return withoutOpen.trim();
+    const searchFrom = bracePos;
+    const closingFence = withoutOpen.indexOf("\n```", searchFrom);
+    if (closingFence !== -1) return withoutOpen.slice(0, closingFence).trim();
+    // No closing fence found — return everything after the opening fence.
+    return withoutOpen.trim();
+  }
+
+  // No fence — return as-is and let JSON.parse surface the error.
+  return trimmed;
 }
 
 /**
