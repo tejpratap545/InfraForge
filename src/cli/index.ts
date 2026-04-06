@@ -71,7 +71,7 @@ function makeWorkflow(
 
 async function run(): Promise<void> {
   const program = new Command();
-  program.name("infra").description("infra-copilot CLI").version("1.0.0");
+  program.name("infraforge").description("InfraForge — AI Infrastructure & SRE Platform").version("1.0.0");
 
   // ── Global options ──────────────────────────────────────────────────────────
   program

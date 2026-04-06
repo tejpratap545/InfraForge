@@ -350,7 +350,7 @@ async function pickSession(): Promise<{ mode: MenuItem; model: MenuItem; reasoni
 
 function printSessionHeader(tenant: TenantContext): void {
   console.log("");
-  printBoxHeader("infra-copilot  ·  v1.0.0");
+  printBoxHeader("InfraForge  ·  v1.0.0");
   console.log("");
   printKV("Tenant", tenant.tenantId,              { keyWidth: 10 });
   printKV("User",   tenant.userId,                { keyWidth: 10 });

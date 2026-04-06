@@ -1,8 +1,8 @@
-# infra-copilot — AI SRE Investigation Platform
+# InfraForge — AI Infrastructure & SRE Platform
 
 ## What This Is
 
-An AI-powered SRE investigation and infrastructure management CLI
+An AI-powered infrastructure management and SRE investigation platform
 
 **Current phase: Core quality** — making every investigation produce accurate, actionable root cause analysis.
 

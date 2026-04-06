@@ -1,12 +1,14 @@
-# infra-copilot
+# InfraForge
 
-AI-powered SRE investigation and infrastructure management CLI. Ask questions, diagnose incidents, and provision infrastructure — all from the terminal.
+AI-powered infrastructure management and SRE investigation platform. Provision AWS resources via Terraform, diagnose production incidents, and query live infrastructure state — all from the terminal.
+
+Built with TypeScript, Claude on AWS Bedrock, and a multi-server MCP architecture supporting 30+ AWS service integrations.
 
 ## Install
 
 ```bash
 npm install
-npm run install:cli   # builds + npm link → installs `infra` globally
+npm run install:cli   # builds + npm link → installs `infraforge` globally
 ```
 
 Or run without installing:
@@ -24,9 +26,9 @@ npm run dev -- <command> [options]
 Simple question answering about live AWS and Kubernetes state.
 
 ```bash
-infra ask -q "how many EKS clusters?"
-infra ask -q "what pods are failing in monitoring?" --k8s-context prod
-infra ask -q "list all RDS instances" --reasoning quick
+infraforge ask -q "how many EKS clusters?"
+infraforge ask -q "what pods are failing in monitoring?" --k8s-context prod
+infraforge ask -q "list all RDS instances" --reasoning quick
 ```
 
 ### `diagnose` — Deep incident investigation
@@ -34,10 +36,10 @@ infra ask -q "list all RDS instances" --reasoning quick
 Root cause analysis across AWS, K8s, logs, metrics. Auto-discovers the kubectl context if not provided.
 
 ```bash
-infra diagnose -q "why is mimir crashing?"
-infra diagnose -q "checkout-api returning 5XX since 10am" --reasoning deep
-infra diagnose -q "cert expired on api.example.com" --namespace prod --since 2h
-infra diagnose -q "high DB latency" --loki-url http://loki:3100 --k8s-context staging
+infraforge diagnose -q "why is mimir crashing?"
+infraforge diagnose -q "checkout-api returning 5XX since 10am" --reasoning deep
+infraforge diagnose -q "cert expired on api.example.com" --namespace prod --since 2h
+infraforge diagnose -q "high DB latency" --loki-url http://loki:3100 --k8s-context staging
 ```
 
 ### `plan` — Infrastructure management
@@ -46,20 +48,20 @@ Three subcommands. `--mode` selects the execution engine.
 
 ```bash
 # Create new infrastructure
-infra plan create -i "create RDS PostgreSQL t3.medium" --mode terraform
-infra plan create -i "add S3 bucket with versioning"   --mode aws
+infraforge plan create -i "create RDS PostgreSQL t3.medium" --mode terraform
+infraforge plan create -i "add S3 bucket with versioning"   --mode aws
 
 # Dry run — see what would change, no execution
-infra plan dry-run -i "add node group to EKS cluster"
+infraforge plan dry-run -i "add node group to EKS cluster"
 
 # Apply changes
-infra plan apply -i "increase ECS service replica count to 4"
-infra plan apply -i "add monitoring namespace" --tf-dir ./infra/eks --mode terraform
+infraforge plan apply -i "increase ECS service replica count to 4"
+infraforge plan apply -i "add monitoring namespace" --tf-dir ./infra/eks --mode terraform
 ```
 
 ### Interactive mode
 
-Run `infra` with no arguments to launch the interactive session. Arrow-key menus guide you through:
+Run `infraforge` with no arguments to launch the interactive session. Arrow-key menus guide you through:
 
 ```
 Mode       → ask | diagnose | plan create | plan dry-run | plan apply
@@ -179,7 +181,7 @@ In interactive mode, if the current directory contains `.tf` files, the TF direc
 Bedrock (LLM) and the tenant account (infrastructure) can be separate AWS accounts:
 
 ```bash
-infra diagnose -q "why is checkout-api down?" \
+infraforge diagnose -q "why is checkout-api down?" \
   --region ap-south-1 \
   --bedrock-access-key-id  AKIA_BEDROCK... --bedrock-secret-access-key bedrock-secret \
   --aws-access-key-id      AKIA_TENANT...  --aws-secret-access-key     tenant-secret

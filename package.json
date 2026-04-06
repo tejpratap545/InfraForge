@@ -1,10 +1,10 @@
 {
-  "name": "infra-copilot",
+  "name": "infraforge",
   "version": "1.0.0",
-  "description": "Production-grade multi-tenant infrastructure copilot CLI",
+  "description": "AI-powered infrastructure management and SRE investigation platform",
   "main": "dist/cli/index.js",
   "bin": {
-    "infra": "dist/cli/index.js"
+    "infraforge": "dist/cli/index.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json && chmod +x dist/cli/index.js",
@@ -20,7 +20,7 @@
     "bedrock",
     "cli"
   ],
-  "author": "infra-copilot",
+  "author": "Tejpratap Singh",
   "license": "MIT",
   "dependencies": {
     "@aws-sdk/client-auto-scaling": "^3.1022.0",

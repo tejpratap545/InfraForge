@@ -1,4 +1,4 @@
-# infra-copilot — Architecture & Flows
+# InfraForge — Architecture & Flows
 
 ## System Overview
 

@@ -1,4 +1,4 @@
-# infra-copilot — AI SRE Platform Roadmap
+# InfraForge — AI SRE Platform Roadmap
 
 ## Current State (as of April 2026)
 
@@ -210,7 +210,7 @@ Redis 7+ with vector search module:
 Phase 2 MVP (CLI):
   SQLite + brute-force cosine similarity
   Embeddings: Bedrock Titan Embeddings v2 (1024-dim)
-  Storage: ~/.infra-copilot/memory.db
+  Storage: ~/.infraforge/memory.db
   Schema: see below
 
 Phase 2→3 (Slack bot, multi-user):
